@@ -55,13 +55,13 @@ async def del_stk(s):
     except:
         pass
 
-async def auto_delete_message(msg, delay):
-    """Auto delete message after delay"""
+async def auto_delete_messages(msg_ids, chat_id, client, delay):
+    """Auto delete multiple messages after delay"""
     await asyncio.sleep(delay)
     try:
-        await msg.delete()
-    except:
-        pass
+        await client.delete_messages(chat_id=chat_id, message_ids=msg_ids)
+    except Exception as e:
+        print(f"Auto delete error: {e}")
 
 # ─────────────────────────
 # /start
@@ -131,7 +131,7 @@ async def start(client, message):
             ]])
         )
 
-    # Handle /start with file_id parameter (जैसे /start files_123_xyz)
+    # Handle /start with file_id parameter
     if len(message.command) > 1:
         mc = message.command[1]
         
@@ -139,6 +139,12 @@ async def start(client, message):
         try:
             parts = mc.split("_")
             if len(parts) >= 3:
+                # Delete /start command message immediately
+                try:
+                    await message.delete()
+                except:
+                    pass
+                
                 # Extract grp_id and file_id
                 grp_id = parts[1]
                 file_id = parts[2]
@@ -146,7 +152,13 @@ async def start(client, message):
                 # Get file details from database
                 files_ = await get_file_details(file_id)
                 if not files_:
-                    return await message.reply('No Such File Exist!')
+                    temp_msg = await client.send_message(
+                        message.chat.id,
+                        '❌ No Such File Exist!'
+                    )
+                    await asyncio.sleep(5)
+                    await temp_msg.delete()
+                    return
                 
                 files = files_
                 settings = await get_settings(int(grp_id))
@@ -171,27 +183,33 @@ async def start(client, message):
                         InlineKeyboardButton('⁉️ ᴄʟᴏsᴇ ⁉️', callback_data='close_data')
                     ]]
                 
-                # Send file
+                # Send file directly
                 vp = await client.send_cached_media(
-                    chat_id=message.from_user.id,
+                    chat_id=message.chat.id,
                     file_id=file_id,
                     caption=f_caption,
                     protect_content=False,
                     reply_markup=InlineKeyboardMarkup(btn)
                 )
                 
-                # Auto delete after PM_FILE_DELETE_TIME
+                # Send copyright notice and store message IDs
                 if PM_FILE_DELETE_TIME and PM_FILE_DELETE_TIME > 0:
                     time = get_readable_time(PM_FILE_DELETE_TIME)
                     msg = await vp.reply(
                         f"Nᴏᴛᴇ: Tʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇ ɪɴ {time} ᴛᴏ ᴀᴠᴏɪᴅ ᴄᴏᴘʏʀɪɢʜᴛs."
                     )
-                    await asyncio.sleep(PM_FILE_DELETE_TIME)
-                    try:
-                        await msg.delete()
-                        await vp.delete()
-                    except:
-                        pass
+                    
+                    # Store message IDs in temp for close button
+                    temp.PM_FILES[vp.id] = {
+                        'file_msg': vp.id,
+                        'note_msg': msg.id,
+                        'chat_id': message.chat.id
+                    }
+                    
+                    # Schedule auto delete
+                    asyncio.create_task(
+                        auto_delete_messages([vp.id, msg.id], message.chat.id, client, PM_FILE_DELETE_TIME)
+                    )
                 return
         except Exception as e:
             print(f"Error parsing start command: {e}")
@@ -318,19 +336,56 @@ async def stream_cb(client, query):
         await query.answer("❌ Error generating links!", show_alert=True)
 
 # ─────────────────────────
-# CLOSE BUTTON
+# CLOSE BUTTON (Delete file + copyright notice)
 # ─────────────────────────
 @Client.on_callback_query(filters.regex("^close_data$"))
-async def close_cb(_, query):
-    """Delete message when close button is clicked"""
+async def close_cb(client, query):
+    """Delete both file message and copyright notice"""
     try:
-        if query.message:
-            await query.message.delete()
-            await query.answer("✅ Deleted", show_alert=False)
+        if not query.message:
+            return await query.answer("Already deleted", show_alert=False)
+        
+        msg_id = query.message.id
+        chat_id = query.message.chat.id
+        
+        # Check if we have stored message IDs for this file
+        msgs_to_delete = [msg_id]
+        
+        if hasattr(temp, 'PM_FILES') and msg_id in temp.PM_FILES:
+            # Get associated note message
+            data = temp.PM_FILES[msg_id]
+            msgs_to_delete.append(data['note_msg'])
+            # Clean up temp storage
+            del temp.PM_FILES[msg_id]
         else:
-            await query.answer("Already deleted", show_alert=False)
+            # Try to delete the message below (copyright notice)
+            try:
+                # Get next message (copyright notice is usually reply to file)
+                msgs_to_delete.append(msg_id + 1)
+            except:
+                pass
+        
+        # Delete all messages
+        try:
+            await client.delete_messages(
+                chat_id=chat_id,
+                message_ids=msgs_to_delete
+            )
+            await query.answer("✅ Deleted", show_alert=False)
+        except Exception as e:
+            print(f"Delete error: {e}")
+            # Try deleting one by one
+            for m_id in msgs_to_delete:
+                try:
+                    await client.delete_messages(chat_id=chat_id, message_ids=m_id)
+                except:
+                    pass
+            await query.answer("✅ Deleted", show_alert=False)
+            
     except Exception as e:
         print(f"Error in close_cb: {e}")
+        import traceback
+        traceback.print_exc()
         try:
             await query.answer()
         except:
