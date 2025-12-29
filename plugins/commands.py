@@ -42,12 +42,6 @@ from utils import (
 # ─────────────────────────
 # HELPERS
 # ─────────────────────────
-def progress_bar(v, t, s=10):
-    if t <= 0:
-        return "░" * s
-    f = int((v / t) * s)
-    return "█" * f + "░" * (s - f)
-
 async def del_stk(s):
     await asyncio.sleep(3)
     try:
@@ -135,21 +129,17 @@ async def start(client, message):
     if len(message.command) > 1:
         mc = message.command[1]
         
-        # Parse: files_grp_id_file_id or file_grp_id_file_id
         try:
             parts = mc.split("_")
             if len(parts) >= 3:
-                # Delete /start command message immediately
                 try:
                     await message.delete()
                 except:
                     pass
                 
-                # Extract grp_id and file_id
                 grp_id = parts[1]
                 file_id = parts[2]
                 
-                # Get file details from database
                 files_ = await get_file_details(file_id)
                 if not files_:
                     temp_msg = await client.send_message(
@@ -163,7 +153,6 @@ async def start(client, message):
                 files = files_
                 settings = await get_settings(int(grp_id))
                 
-                # Build caption
                 CAPTION = settings.get('caption', '{file_name}\n\n💾 Size: {file_size}')
                 f_caption = CAPTION.format(
                     file_name=files.get('file_name', 'File'),
@@ -171,7 +160,6 @@ async def start(client, message):
                     file_caption=files.get('caption', '')
                 )
                 
-                # Build buttons based on IS_STREAM setting
                 if IS_STREAM:
                     btn = [[
                         InlineKeyboardButton("✛ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ✛", callback_data=f"stream#{file_id}")
@@ -183,7 +171,6 @@ async def start(client, message):
                         InlineKeyboardButton('⁉️ ᴄʟᴏsᴇ ⁉️', callback_data='close_data')
                     ]]
                 
-                # Send file directly
                 vp = await client.send_cached_media(
                     chat_id=message.chat.id,
                     file_id=file_id,
@@ -192,21 +179,21 @@ async def start(client, message):
                     reply_markup=InlineKeyboardMarkup(btn)
                 )
                 
-                # Send copyright notice and store message IDs
                 if PM_FILE_DELETE_TIME and PM_FILE_DELETE_TIME > 0:
                     time = get_readable_time(PM_FILE_DELETE_TIME)
                     msg = await vp.reply(
                         f"Nᴏᴛᴇ: Tʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇ ɪɴ {time} ᴛᴏ ᴀᴠᴏɪᴅ ᴄᴏᴘʏʀɪɢʜᴛs."
                     )
                     
-                    # Store message IDs in temp for close button
+                    if not hasattr(temp, 'PM_FILES'):
+                        temp.PM_FILES = {}
+                    
                     temp.PM_FILES[vp.id] = {
                         'file_msg': vp.id,
                         'note_msg': msg.id,
                         'chat_id': message.chat.id
                     }
                     
-                    # Schedule auto delete
                     asyncio.create_task(
                         auto_delete_messages([vp.id, msg.id], message.chat.id, client, PM_FILE_DELETE_TIME)
                     )
@@ -239,7 +226,7 @@ async def start(client, message):
         )
 
 # ─────────────────────────
-# /stats
+# /stats - CLEAN FORMAT
 # ─────────────────────────
 @Client.on_message(filters.command("stats") & filters.user(ADMINS))
 async def stats(_, message):
@@ -257,135 +244,286 @@ async def stats(_, message):
     text = f"""
 📊 <b>Bot Statistics</b>
 
-👥 Users   : {users}
-👥 Groups  : {chats}
-💎 Premium : {premium}
+👥 <b>Users</b>   : <code>{users}</code>
+👥 <b>Groups</b>  : <code>{chats}</code>
+💎 <b>Premium</b> : <code>{premium}</code>
 
-📁 <b>Files</b>
+📁 <b>Files Database</b>
 
-Primary   {progress_bar(primary,total)} {primary}
-Cloud     {progress_bar(cloud,total)} {cloud}
-Archive   {progress_bar(archive,total)} {archive}
+📂 Primary   : <code>{primary}</code>
+☁️ Cloud     : <code>{cloud}</code>
+🗄 Archive   : <code>{archive}</code>
 
-🧮 Total Files : {total}
-⏱ Uptime : {get_readable_time(time_now() - temp.START_TIME)}
+🧮 <b>Total Files</b> : <code>{total}</code>
+⏱ <b>Uptime</b> : <code>{get_readable_time(time_now() - temp.START_TIME)}</code>
 """
 
     await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
 # ─────────────────────────
-# STREAM CALLBACK → Generate Watch/Download Links
+# /delete - DELETE BY FILE NAME
+# ─────────────────────────
+@Client.on_message(filters.command("delete") & filters.user(ADMINS))
+async def delete_file(client, message):
+    """
+    Usage: /delete <storage_type> <file_name>
+    
+    Examples:
+    /delete primary Avengers.mkv
+    /delete cloud Spider-Man.mp4
+    /delete archive Batman.pdf
+    """
+    
+    if len(message.command) < 3:
+        return await message.reply_text(
+            "❌ <b>Invalid Format!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/delete [storage] [filename]</code>\n\n"
+            "<b>Storage Options:</b>\n"
+            "• <code>primary</code>\n"
+            "• <code>cloud</code>\n"
+            "• <code>archive</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/delete primary Avengers.mkv</code>",
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    storage_type = message.command[1].lower()
+    file_name = " ".join(message.command[2:])
+    
+    if storage_type not in ["primary", "cloud", "archive"]:
+        return await message.reply_text(
+            "❌ <b>Invalid Storage!</b>\n\n"
+            "Choose: <code>primary</code>, <code>cloud</code>, or <code>archive</code>",
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    sts = await message.reply_text("🔍 Searching...")
+    
+    try:
+        deleted_count = await delete_files(file_name, storage_type)
+        
+        if deleted_count > 0:
+            await sts.edit_text(
+                f"✅ <b>Deleted Successfully!</b>\n\n"
+                f"📂 <b>Storage:</b> <code>{storage_type.upper()}</code>\n"
+                f"📄 <b>File:</b> <code>{file_name}</code>\n"
+                f"🗑 <b>Deleted:</b> <code>{deleted_count}</code> file(s)",
+                parse_mode=enums.ParseMode.HTML
+            )
+        else:
+            await sts.edit_text(
+                f"❌ <b>Not Found!</b>\n\n"
+                f"📂 <b>Storage:</b> <code>{storage_type.upper()}</code>\n"
+                f"📄 <b>File:</b> <code>{file_name}</code>",
+                parse_mode=enums.ParseMode.HTML
+            )
+    
+    except Exception as e:
+        await sts.edit_text(f"❌ Error: {str(e)}")
+        print(f"Delete error: {e}")
+
+# ─────────────────────────
+# /delete_all - DELETE ALL FROM STORAGE
+# ─────────────────────────
+@Client.on_message(filters.command("delete_all") & filters.user(ADMINS))
+async def delete_all_files(client, message):
+    """
+    Usage: /delete_all <storage_type>
+    
+    Examples:
+    /delete_all primary
+    /delete_all cloud
+    /delete_all archive
+    /delete_all all
+    """
+    
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "❌ <b>Invalid Format!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "<code>/delete_all [storage]</code>\n\n"
+            "<b>Storage Options:</b>\n"
+            "• <code>primary</code> - Delete Primary files\n"
+            "• <code>cloud</code> - Delete Cloud files\n"
+            "• <code>archive</code> - Delete Archive files\n"
+            "• <code>all</code> - Delete ALL (⚠️ Dangerous)\n\n"
+            "<b>Example:</b>\n"
+            "<code>/delete_all primary</code>",
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    storage_type = message.command[1].lower()
+    
+    if storage_type not in ["primary", "cloud", "archive", "all"]:
+        return await message.reply_text(
+            "❌ <b>Invalid Storage!</b>\n\n"
+            "Choose: <code>primary</code>, <code>cloud</code>, <code>archive</code>, <code>all</code>",
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    # Confirmation
+    buttons = [
+        [
+            InlineKeyboardButton("✅ YES DELETE", callback_data=f"confirm_del#{storage_type}"),
+            InlineKeyboardButton("❌ CANCEL", callback_data="cancel_del")
+        ]
+    ]
+    
+    if storage_type == "all":
+        warning = (
+            "⚠️ <b>DANGER WARNING!</b> ⚠️\n\n"
+            "Delete <b>ALL FILES</b> from:\n"
+            "• Primary Storage\n"
+            "• Cloud Storage\n"
+            "• Archive Storage\n\n"
+            "🚨 <b>CANNOT BE UNDONE!</b>\n\n"
+            "Confirm?"
+        )
+    else:
+        warning = (
+            f"⚠️ <b>WARNING!</b>\n\n"
+            f"Delete <b>ALL FILES</b> from:\n"
+            f"📂 <code>{storage_type.upper()}</code>\n\n"
+            f"Cannot be undone!\n\n"
+            f"Confirm?"
+        )
+    
+    await message.reply_text(
+        warning,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=enums.ParseMode.HTML
+    )
+
+# ─────────────────────────
+# CALLBACK: Confirm Delete All
+# ─────────────────────────
+@Client.on_callback_query(filters.regex(r"^confirm_del#"))
+async def confirm_delete_cb(client, query):
+    storage = query.data.split("#")[1]
+    
+    await query.message.edit_text("🗑 Deleting... Please wait...")
+    
+    try:
+        if storage == "all":
+            # Delete from all storages
+            p_del = await delete_files("*", "primary")
+            c_del = await delete_files("*", "cloud")
+            a_del = await delete_files("*", "archive")
+            
+            result = (
+                "✅ <b>All Files Deleted!</b>\n\n"
+                f"📂 Primary: <code>{p_del}</code>\n"
+                f"☁️ Cloud: <code>{c_del}</code>\n"
+                f"🗄 Archive: <code>{a_del}</code>\n\n"
+                f"🗑 Total: <code>{p_del + c_del + a_del}</code>"
+            )
+        else:
+            # Delete from specific storage
+            deleted = await delete_files("*", storage)
+            result = (
+                f"✅ <b>Files Deleted!</b>\n\n"
+                f"📂 Storage: <code>{storage.upper()}</code>\n"
+                f"🗑 Deleted: <code>{deleted}</code> files"
+            )
+        
+        await query.message.edit_text(result, parse_mode=enums.ParseMode.HTML)
+        
+    except Exception as e:
+        await query.message.edit_text(f"❌ Error: {str(e)}")
+
+@Client.on_callback_query(filters.regex("^cancel_del$"))
+async def cancel_delete_cb(client, query):
+    await query.message.edit_text(
+        "❌ <b>Cancelled</b>",
+        parse_mode=enums.ParseMode.HTML
+    )
+
+# ─────────────────────────
+# STREAM CALLBACK
 # ─────────────────────────
 @Client.on_callback_query(filters.regex(r"^stream#"))
 async def stream_cb(client, query):
-    """When user clicks 'Watch & Download' button"""
     try:
         file_id = query.data.split("#", 1)[1]
         
-        await query.answer("⏳ Generating links...", show_alert=False)
+        await query.answer("⏳ Generating...", show_alert=False)
 
-        # Get file details
         files = await get_file_details(file_id)
         if not files:
-            return await query.answer("❌ File not found!", show_alert=True)
+            return await query.answer("❌ Not found!", show_alert=True)
         
-        # Handle both list and dict response
         file = files[0] if isinstance(files, list) else files
         
-        # Send file to BIN_CHANNEL to get message_id for streaming
         msg = await client.send_cached_media(
             chat_id=BIN_CHANNEL,
             file_id=file_id
         )
 
-        # Generate streaming URLs
         watch = f"{URL}watch/{msg.id}"
         download = f"{URL}download/{msg.id}"
 
-        # Create buttons with links
         buttons = [
             [
-                InlineKeyboardButton("▶️ ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ", url=watch),
-                InlineKeyboardButton("⬇️ ꜰᴀsᴛ ᴅᴏᴡɴʟᴏᴀᴅ", url=download)
+                InlineKeyboardButton("▶️ ᴡᴀᴛᴄʜ", url=watch),
+                InlineKeyboardButton("⬇️ ᴅᴏᴡɴʟᴏᴀᴅ", url=download)
             ],
             [
                 InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")
             ]
         ]
 
-        # Try to edit the message buttons
         try:
             await query.message.edit_reply_markup(
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
-        except Exception as e:
-            # If edit fails, send new message
-            print(f"Failed to edit markup: {e}")
+        except:
             await query.message.reply_text(
-                "🎬 <b>Your Links Are Ready:</b>\n\n"
-                "▶️ Click <b>Watch Online</b> to stream\n"
-                "⬇️ Click <b>Fast Download</b> to save",
+                "🎬 <b>Links Ready:</b>",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode=enums.ParseMode.HTML
             )
         
     except Exception as e:
-        print(f"❌ Error in stream_cb: {e}")
-        import traceback
-        traceback.print_exc()
-        await query.answer("❌ Error generating links!", show_alert=True)
+        print(f"Stream error: {e}")
+        await query.answer("❌ Error!", show_alert=True)
 
 # ─────────────────────────
-# CLOSE BUTTON (Delete file + copyright notice)
+# CLOSE BUTTON
 # ─────────────────────────
 @Client.on_callback_query(filters.regex("^close_data$"))
 async def close_cb(client, query):
-    """Delete both file message and copyright notice"""
     try:
         if not query.message:
-            return await query.answer("Already deleted", show_alert=False)
+            return await query.answer("Deleted", show_alert=False)
         
         msg_id = query.message.id
         chat_id = query.message.chat.id
-        
-        # Check if we have stored message IDs for this file
-        msgs_to_delete = [msg_id]
+        msgs = [msg_id]
         
         if hasattr(temp, 'PM_FILES') and msg_id in temp.PM_FILES:
-            # Get associated note message
             data = temp.PM_FILES[msg_id]
-            msgs_to_delete.append(data['note_msg'])
-            # Clean up temp storage
+            msgs.append(data['note_msg'])
             del temp.PM_FILES[msg_id]
         else:
-            # Try to delete the message below (copyright notice)
             try:
-                # Get next message (copyright notice is usually reply to file)
-                msgs_to_delete.append(msg_id + 1)
+                msgs.append(msg_id + 1)
             except:
                 pass
         
-        # Delete all messages
         try:
-            await client.delete_messages(
-                chat_id=chat_id,
-                message_ids=msgs_to_delete
-            )
+            await client.delete_messages(chat_id=chat_id, message_ids=msgs)
             await query.answer("✅ Deleted", show_alert=False)
-        except Exception as e:
-            print(f"Delete error: {e}")
-            # Try deleting one by one
-            for m_id in msgs_to_delete:
+        except:
+            for m in msgs:
                 try:
-                    await client.delete_messages(chat_id=chat_id, message_ids=m_id)
+                    await client.delete_messages(chat_id=chat_id, message_ids=m)
                 except:
                     pass
             await query.answer("✅ Deleted", show_alert=False)
             
     except Exception as e:
-        print(f"Error in close_cb: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Close error: {e}")
         try:
             await query.answer()
         except:
