@@ -131,10 +131,10 @@ async def next_page(bot, query):
     settings = await get_settings(query.message.chat.id)
     del_msg = f"\n\n<b>⚠️ ᴛʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴀᴜᴛᴏ ᴅᴇʟᴇᴛᴇ ᴀꜰᴛᴇʀ <code>{get_readable_time(DELETE_TIME)}</code> ᴛᴏ ᴀᴠᴏɪᴅ ᴄᴏᴘʏʀɪɢʜᴛ ɪssᴜᴇs</b>" if settings["auto_delete"] else ''
     
-    # Simple file links format
-    files_text = f"<b>📁 Found {total} Files</b>\n\n"
-    for file_num, file in enumerate(files, start=offset+1):
-        files_text += f"{file_num}. <a href='https://t.me/{temp.U_NAME}?start=file_{query.message.chat.id}_{file['_id']}'>{file['file_name']}</a> - {get_size(file['file_size'])}\n"
+    # File links format with folder emoji
+    files_text = ""
+    for file in files:
+        files_text += f"📁 <a href='https://t.me/{temp.U_NAME}?start=file_{query.message.chat.id}_{file['_id']}'>[{get_size(file['file_size'])}] {file['file_name']}</a>\n\n"
 
     # Navigation buttons
     btn = []
@@ -184,7 +184,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
         except:
             pass
   
-
+None
 
     elif query.data == "buttons":
         await query.answer()
@@ -294,10 +294,10 @@ async def auto_filter(client, msg, s, spoll=False):
     temp.FILES[key] = files
     BUTTONS[key] = search
     
-    # Simple file links
-    files_text = f"<b>📁 Found {total_results} Files</b>\n\n"
-    for file_num, file in enumerate(files[:10], start=1):
-        files_text += f"{file_num}. <a href='https://t.me/{temp.U_NAME}?start=file_{message.chat.id}_{file['_id']}'>{file['file_name']}</a> - {get_size(file['file_size'])}\n"
+    # File links with folder emoji
+    files_text = ""
+    for file in files[:10]:
+        files_text += f"📁 <a href='https://t.me/{temp.U_NAME}?start=file_{message.chat.id}_{file['_id']}'>[{get_size(file['file_size'])}] {file['file_name']}</a>\n\n"
     
     btn = []
     if offset != "":
@@ -309,7 +309,7 @@ async def auto_filter(client, msg, s, spoll=False):
     btn.append([InlineKeyboardButton("♻️ sᴇɴᴅ ᴀʟʟ", callback_data=f"send_all#{key}#{req}")])
     btn.append([InlineKeyboardButton('❌ ᴄʟᴏsᴇ', callback_data='close_data')])
     
-    cap = f"<b>💭 ʜᴇʏ {message.from_user.mention},\n♻️ ʜᴇʀᴇ ɪ ꜰᴏᴜɴᴅ ꜰᴏʀ ʏᴏᴜʀ sᴇᴀʀᴄʜ {search}...</b>"
+    cap = f"<b>👑 Search: {search}\n🎬 Total Files: {total_results}\n📄 Page: {1 if not offset else math.ceil(offset/MAX_BTN) + 1} / {math.ceil(total_results/MAX_BTN)}</b>\n\n"
     CAP[key] = cap
     del_msg = f"\n\n<b>⚠️ ᴛʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴀᴜᴛᴏ ᴅᴇʟᴇᴛᴇ ᴀꜰᴛᴇʀ <code>{get_readable_time(DELETE_TIME)}</code> ᴛᴏ ᴀᴠᴏɪᴅ ᴄᴏᴘʏʀɪɢʜᴛ ɪssᴜᴇs</b>" if settings["auto_delete"] else ''
     
