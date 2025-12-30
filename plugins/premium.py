@@ -25,6 +25,30 @@ TRIAL_ENABLED = False
 
 
 # ─────────────────────────────────────────────
+# 🔧 HELPER: Convert expire to datetime
+# ─────────────────────────────────────────────
+def parse_expire_time(expire):
+    """
+    Convert expire field to datetime object
+    Handles both string and datetime formats
+    """
+    if not expire:
+        return None
+    
+    if isinstance(expire, datetime):
+        return expire
+    
+    if isinstance(expire, str):
+        try:
+            from dateutil import parser
+            return parser.parse(expire)
+        except:
+            return None
+    
+    return None
+
+
+# ─────────────────────────────────────────────
 # 💎 PREMIUM CHECK (Synced with utils.py)
 # ─────────────────────────────────────────────
 async def is_premium(user_id, bot):
@@ -36,22 +60,30 @@ async def is_premium(user_id, bot):
 
     mp = db.get_plan(user_id)
     if mp.get("premium"):
-        if mp.get("expire") and mp["expire"] < datetime.now():
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"❌ Your premium {mp.get('plan')} plan has expired.\n\nUse /plan to renew your subscription."
-                )
-            except Exception:
-                pass
+        expire = mp.get("expire")
+        
+        # ✅ Convert to datetime if needed
+        expire_dt = parse_expire_time(expire)
+        
+        if expire_dt:
+            # Check if expired
+            if expire_dt < datetime.now():
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"❌ Your premium {mp.get('plan')} plan has expired.\n\nUse /plan to renew your subscription."
+                    )
+                except Exception:
+                    pass
 
-            mp.update({
-                "expire": "",
-                "plan": "",
-                "premium": False
-            })
-            db.update_plan(user_id, mp)
-            return False
+                mp.update({
+                    "expire": "",
+                    "plan": "",
+                    "premium": False
+                })
+                db.update_plan(user_id, mp)
+                return False
+        
         return True
     return False
 
@@ -74,7 +106,12 @@ async def check_premium_expired(bot):
                 mp = p.get("status", {})
                 
                 if mp.get("premium") and mp.get("expire"):
-                    expire_time = mp["expire"]
+                    # ✅ Convert to datetime
+                    expire_time = parse_expire_time(mp["expire"])
+                    
+                    if not expire_time:
+                        continue
+                    
                     time_left = expire_time - current_time
                     
                     # Check if expired
@@ -200,14 +237,26 @@ async def myplan(client: Client, message: Message):
             reply_markup=InlineKeyboardMarkup(btn)
         )
     
-    expire_time = mp['expire']
+    # ✅ Convert expire to datetime
+    expire_time = parse_expire_time(mp.get('expire'))
+    
+    if not expire_time:
+        return await message.reply(
+            f"✅ <b>Your Premium Status</b>\n\n"
+            f"📦 Plan: {mp.get('plan', 'Unknown')}\n"
+            f"⏰ Status: Active\n\n"
+            f"💡 Use /plan to extend your subscription.",
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    # Calculate time left
     time_left = expire_time - datetime.now()
-    days_left = time_left.days
-    hours_left = time_left.seconds // 3600
+    days_left = max(0, time_left.days)
+    hours_left = max(0, time_left.seconds // 3600)
     
     await message.reply(
         f"✅ <b>Your Premium Status</b>\n\n"
-        f"📦 Plan: {mp['plan']}\n"
+        f"📦 Plan: {mp.get('plan', 'Unknown')}\n"
         f"⏰ Expires: {expire_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"⏳ Time Left: {days_left} days {hours_left} hours\n\n"
         f"💡 Use /plan to extend your subscription.",
@@ -347,7 +396,6 @@ async def remove_premium(bot: Client, message: Message):
     else:
         mp = db.get_plan(user.id)
         old_plan = mp.get('plan', 'Unknown')
-        old_expire = mp.get('expire', '')
         
         mp['expire'] = ''
         mp['plan'] = ''
@@ -409,10 +457,16 @@ async def premium_list(bot: Client, message: Message):
             plan = mp.get('plan', 'Unknown')
             
             if expire:
-                time_left = expire - datetime.now()
-                days_left = time_left.days
-                t += f"{idx}. {u.mention} (<code>{p['id']}</code>)\n"
-                t += f"   Plan: {plan} | Days left: {days_left}\n\n"
+                # ✅ Convert to datetime
+                expire_dt = parse_expire_time(expire)
+                if expire_dt:
+                    time_left = expire_dt - datetime.now()
+                    days_left = max(0, time_left.days)
+                    t += f"{idx}. {u.mention} (<code>{p['id']}</code>)\n"
+                    t += f"   Plan: {plan} | Days left: {days_left}\n\n"
+                else:
+                    t += f"{idx}. {u.mention} (<code>{p['id']}</code>)\n"
+                    t += f"   Plan: {plan}\n\n"
             else:
                 t += f"{idx}. {u.mention} (<code>{p['id']}</code>)\n"
                 t += f"   Plan: {plan}\n\n"
