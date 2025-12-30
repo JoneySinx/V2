@@ -466,7 +466,7 @@ async def cancel_delete_cb(client, query):
 @Client.on_callback_query(filters.regex("^myplan$"))
 async def myplan_cb(client, query):
     """Handle myplan button callback"""
-    from plugins.Premium import TRIAL_ENABLED
+    from plugins.premium import TRIAL_ENABLED
     
     if not IS_PREMIUM:
         return await query.answer('Premium feature was disabled by admin', show_alert=True)
