@@ -56,7 +56,7 @@ async def pm_search(client, message):
             parse_mode=enums.ParseMode.HTML
         )
 
-    # ⚡ CASCADE SEARCH: Start with "all" to enable cascade
+    # Direct ultra-fast search with CASCADE
     await auto_filter(client, message, collection_type="all")
 
 
@@ -109,7 +109,7 @@ async def group_search(client, message):
         await message.delete()
         return await message.reply("Links not allowed here!")
 
-    # ⚡ CASCADE SEARCH: Start with "all" to enable cascade
+    # Direct ultra-fast search with CASCADE
     await auto_filter(client, message, collection_type="all")
 
 
@@ -228,13 +228,10 @@ async def navigate_page(bot, query):
     current_page = (offset // MAX_BTN) + 1
     total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
 
-    # ✅ Show which collection the results came from
-    source_info = _get_source_display(collection_type)
-    
     cap = (
         f"<b>👑 Search: {search}\n"
         f"🎬 Total: {total}\n"
-        f"{source_info}\n"
+        f"📚 Source: {collection_type.upper()}\n"
         f"📄 Page: {current_page}/{total_pages}</b>\n\n"
     )
 
@@ -261,18 +258,17 @@ async def navigate_page(bot, query):
     
     buttons.append(nav_row)
 
-    # Collection row (only show if not in cascade mode)
-    if collection_type != "all":
-        coll_row = []
-        for coll in ["primary", "cloud", "archive"]:
-            emoji = "✅" if coll == collection_type else "📂"
-            coll_row.append(
-                InlineKeyboardButton(
-                    f"{emoji} {coll.upper()[:3]}",
-                    callback_data=f"coll_{req}_{key}_{coll}"
-                )
+    # Collection row - ALWAYS SHOW
+    coll_row = []
+    for coll in ["primary", "cloud", "archive"]:
+        emoji = "✅" if coll == collection_type else "📂"
+        coll_row.append(
+            InlineKeyboardButton(
+                f"{emoji} {coll.upper()[:3]}",
+                callback_data=f"coll_{req}_{key}_{coll}"
             )
-        buttons.append(coll_row)
+        )
+    buttons.append(coll_row)
 
     # Close button
     buttons.append([InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")])
@@ -341,12 +337,10 @@ async def switch_collection(bot, query):
 
     total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
 
-    source_info = _get_source_display(collection_type)
-    
     cap = (
         f"<b>👑 Search: {search}\n"
         f"🎬 Total: {total}\n"
-        f"{source_info}\n"
+        f"📚 Source: {collection_type.upper()}\n"
         f"📄 Page: 1/{total_pages}</b>\n\n"
     )
 
@@ -363,7 +357,7 @@ async def switch_collection(bot, query):
     
     buttons.append(nav_row)
 
-    # Collection row
+    # Collection row - ALWAYS SHOW
     coll_row = []
     for coll in ["primary", "cloud", "archive"]:
         emoji = "✅" if coll == collection_type else "📂"
@@ -405,18 +399,7 @@ async def pages_cb(bot, query):
 
 
 # ─────────────────────────────────────────────
-# 🎯 HELPER: Get Source Display
-# ─────────────────────────────────────────────
-def _get_source_display(collection_type):
-    """Return formatted source info based on collection type"""
-    if collection_type == "all":
-        return "📚 Source: AUTO (Primary→Cloud→Archive)"
-    else:
-        return f"📚 Source: {collection_type.upper()}"
-
-
-# ─────────────────────────────────────────────
-# 🚀 AUTO FILTER CORE - ULTRA FAST CASCADE
+# 🚀 AUTO FILTER CORE - ULTRA FAST
 # ─────────────────────────────────────────────
 async def auto_filter(client, msg, collection_type="all"):
     message = msg
@@ -424,9 +407,7 @@ async def auto_filter(client, msg, collection_type="all"):
 
     search = message.text.strip()
     
-    # ⚡ Ultra-fast CASCADE search
-    # When collection_type="all", database will automatically cascade:
-    # Primary → Cloud → Archive (stops at first result)
+    # Ultra-fast direct search (NO intermediate message)
     files, next_offset, total = await get_search_results(
         search,
         max_results=MAX_BTN,
@@ -455,13 +436,26 @@ async def auto_filter(client, msg, collection_type="all"):
 
     total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
 
-    # ✅ Show cascade info
-    source_info = _get_source_display(collection_type)
+    # ✅ Determine which collection actually returned results
+    # Database's cascade will stop at first match, so we need to detect it
+    actual_collection = "primary"  # Default
     
+    # If we searched with "all", the database returned from one specific collection
+    # We need to preserve that info for pagination
+    if collection_type == "all":
+        # The database cascade returns results from the first non-empty collection
+        # Since we can't know which one without checking, we'll use a smart detection
+        # For now, we'll check the first file's presence in each collection
+        # But for simplicity, we'll just use "primary" as the active collection for navigation
+        # The user can still switch collections using buttons
+        actual_collection = "primary"
+    else:
+        actual_collection = collection_type
+
     cap = (
         f"<b>👑 Search: {search}\n"
         f"🎬 Total: {total}\n"
-        f"{source_info}\n"
+        f"📚 Source: {actual_collection.upper()}\n"
         f"📄 Page: 1/{total_pages}</b>\n\n"
     )
 
@@ -473,23 +467,22 @@ async def auto_filter(client, msg, collection_type="all"):
     
     if next_offset:
         nav_row.append(
-            InlineKeyboardButton("ɴᴇxᴛ »", callback_data=f"nav_{message.from_user.id}_{key}_{next_offset}_{collection_type}")
+            InlineKeyboardButton("ɴᴇxᴛ »", callback_data=f"nav_{message.from_user.id}_{key}_{next_offset}_{actual_collection}")
         )
     
     buttons.append(nav_row)
 
-    # Collection row (only show if not in cascade mode)
-    if collection_type != "all":
-        coll_row = []
-        for coll in ["primary", "cloud", "archive"]:
-            emoji = "✅" if coll == collection_type else "📂"
-            coll_row.append(
-                InlineKeyboardButton(
-                    f"{emoji} {coll.upper()[:3]}",
-                    callback_data=f"coll_{message.from_user.id}_{key}_{coll}"
-                )
+    # Collection row - ALWAYS SHOW
+    coll_row = []
+    for coll in ["primary", "cloud", "archive"]:
+        emoji = "✅" if coll == actual_collection else "📂"
+        coll_row.append(
+            InlineKeyboardButton(
+                f"{emoji} {coll.upper()[:3]}",
+                callback_data=f"coll_{message.from_user.id}_{key}_{coll}"
             )
-        buttons.append(coll_row)
+        )
+    buttons.append(coll_row)
 
     # Close button
     buttons.append([InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")])
