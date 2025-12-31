@@ -1,4 +1,4 @@
-hydrogram==0.1.4
+hydrogram
 tgcrypto
 pymongo
 aiohttp
@@ -9,3 +9,4 @@ requests
 qrcode
 Pillow
 pytz
+pyromod
