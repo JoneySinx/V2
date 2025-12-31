@@ -1,495 +1,518 @@
-import asyncio
+import logging
 import re
-import math
+import base64
+from struct import pack
 
-from hydrogram import Client, filters, enums
-from hydrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+from hydrogram.file_id import FileId
+from pymongo import MongoClient, TEXT
+from pymongo.errors import DuplicateKeyError
+
+from info import USE_CAPTION_FILTER, DATABASE_URL, DATABASE_NAME, MAX_BTN
+
+logger = logging.getLogger(__name__)
+
+# Note: Do NOT import get_search_results here - it causes circular import!
+
+# ─────────────────────────────────────────
+# ⚙️ MONGODB CONNECTION (POOL OPTIMIZED)
+# ─────────────────────────────────────────
+client = MongoClient(
+    DATABASE_URL,
+    maxPoolSize=50,
+    minPoolSize=10,
+    maxIdleTimeMS=45000
 )
+db = client[DATABASE_NAME]
 
-from info import (
-    ADMINS,
-    DELETE_TIME,
-    MAX_BTN,
-    IS_PREMIUM,
-    PICS
-)
+primary = db["Primary"]
+cloud   = db["Cloud"]
+archive = db["Archive"]
 
-from utils import (
-    is_premium,
-    get_size,
-    is_check_admin,
-    get_readable_time,
-    temp,
-    get_settings,
-    save_group_settings,
-    get_premium_button
-)
+COLLECTIONS = {
+    "primary": primary,
+    "cloud": cloud,
+    "archive": archive
+}
 
-from database.users_chats_db import db
-from database.ia_filterdb import get_search_results
+# ─────────────────────────────────────────
+# ⚡ INDEXES (ABSOLUTE MUST)
+# ─────────────────────────────────────────
+def ensure_indexes():
+    """Create text indexes for fast search"""
+    for name, col in COLLECTIONS.items():
+        try:
+            col.create_index(
+                [("file_name", TEXT), ("caption", TEXT)],
+                name=f"{name}_text"
+            )
+            # Silent - no logs for index creation
+        except Exception as e:
+            logger.error(f"Index creation failed for {name}: {e}")
 
-import random
+ensure_indexes()
 
-BUTTONS = {}
+# ─────────────────────────────────────────
+# 🧠 FAST NORMALIZER (NO CPU COST)
+# ─────────────────────────────────────────
+REPLACEMENTS = str.maketrans({
+    "0": "o", "1": "i", "3": "e",
+    "4": "a", "5": "s", "7": "t"
+})
 
-# ─────────────────────────────────────────────
-# 🔍 PRIVATE SEARCH (PREMIUM REQUIRED)
-# ─────────────────────────────────────────────
-@Client.on_message(filters.private & filters.text & filters.incoming)
-async def pm_search(client, message):
-    if message.text.startswith("/"):
-        return
+def normalize_query(q: str) -> str:
+    """Normalize search query for better results"""
+    q = q.lower().translate(REPLACEMENTS)
+    q = re.sub(r"[^a-z0-9\s]", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
 
-    # ✅ Premium check (synced with Premium.py)
-    if IS_PREMIUM and not await is_premium(message.from_user.id, client):
-        return await message.reply_photo(
-            random.choice(PICS),
-            caption="🔒 <b>Premium Required</b>\n\n"
-                    "Search feature is only available for Premium users!\n\n"
-                    "Use /plan to activate premium subscription.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💎 Buy Premium", callback_data="activate_plan"),
-                InlineKeyboardButton("📊 My Plan", callback_data="myplan")
-            ]]),
-            parse_mode=enums.ParseMode.HTML
-        )
+def prefix_query(q: str) -> str:
+    """Create prefix query for fallback search"""
+    return " ".join(w[:4] for w in q.split() if len(w) >= 3)
 
-    # Direct ultra-fast search with CASCADE
-    await auto_filter(client, message, collection_type="all")
+# ─────────────────────────────────────────
+# 📊 DB STATS (FAST)
+# ─────────────────────────────────────────
+def db_count_documents():
+    """Get document counts from all collections"""
+    try:
+        p = primary.estimated_document_count()
+        c = cloud.estimated_document_count()
+        a = archive.estimated_document_count()
+        return {
+            "primary": p,
+            "cloud": c,
+            "archive": a,
+            "total": p + c + a
+        }
+    except Exception as e:
+        logger.error(f"Error counting documents: {e}")
+        return {"primary": 0, "cloud": 0, "archive": 0, "total": 0}
 
-
-# ─────────────────────────────────────────────
-# 🔍 GROUP SEARCH (WITH ON/OFF CONTROL)
-# ─────────────────────────────────────────────
-@Client.on_message(filters.group & filters.text & filters.incoming)
-async def group_search(client, message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else 0
-
-    if not user_id:
-        return
-
-    if message.text.startswith("/"):
-        return
-
-    # ✅ Check if search is enabled in this group
-    settings = await get_settings(chat_id)
-    search_enabled = settings.get("search_enabled", True)  # Default: ON
-    
-    # If search is OFF, silently ignore all searches (no reply to anyone)
-    if not search_enabled:
-        return
-
-    # ✅ Premium check (synced with Premium.py)
-    if IS_PREMIUM and not await is_premium(user_id, client):
-        return
-
-    # admin mention handler
-    if "@admin" in message.text.lower() or "@admins" in message.text.lower():
-        if await is_check_admin(client, chat_id, user_id):
-            return
-
-        admins = []
-        async for member in client.get_chat_members(
-            chat_id, enums.ChatMembersFilter.ADMINISTRATORS
-        ):
-            if not member.user.is_bot:
-                admins.append(member.user.id)
-
-        hidden = "".join(f"[\u2064](tg://user?id={i})" for i in admins)
-        await message.reply_text("Report sent!" + hidden)
-        return
-
-    # block links for non-admins
-    if re.findall(r"https?://\S+|www\.\S+|t\.me/\S+|@\w+", message.text):
-        if await is_check_admin(client, chat_id, user_id):
-            return
-        await message.delete()
-        return await message.reply("Links not allowed here!")
-
-    # Direct ultra-fast search with CASCADE
-    await auto_filter(client, message, collection_type="all")
-
-
-# ─────────────────────────────────────────────
-# ⚙️ ADMIN COMMANDS - SEARCH ON/OFF
-# ─────────────────────────────────────────────
-@Client.on_message(filters.command("search") & filters.group)
-async def search_toggle(client, message):
+# ─────────────────────────────────────────
+# 💾 SAVE FILE (FAST & SAFE)
+# ─────────────────────────────────────────
+async def save_file(media, collection_type="primary"):
     """
-    Toggle group search on/off
-    Usage: /search on | /search off
-    Admin only command
+    Save file to database
+    
+    Args:
+        media: File object with file_id, file_name, caption, file_size
+        collection_type: "primary", "cloud", or "archive"
+    
+    Returns:
+        "suc" on success, "dup" if duplicate
     """
-    chat_id = message.chat.id
-    user_id = message.from_user.id
+    try:
+        file_id = unpack_new_file_id(media.file_id)
+
+        doc = {
+            "_id": file_id,
+            "file_name": re.sub(r"@\w+", "", media.file_name or "").strip(),
+            "caption": re.sub(r"@\w+", "", media.caption or "").strip(),
+            "file_size": media.file_size
+        }
+
+        col = COLLECTIONS.get(collection_type, primary)
+
+        col.insert_one(doc)
+        # Silent - no logs for file save
+        return "suc"
+    except DuplicateKeyError:
+        # Silent - no logs for duplicate
+        return "dup"
+    except Exception as e:
+        logger.error(f"Error saving file: {e}")
+        return "err"
+
+# ─────────────────────────────────────────
+# 🔍 ULTRA FAST SEARCH CORE
+# ─────────────────────────────────────────
+def _text_filter(q):
+    """Create MongoDB text search filter"""
+    return {"$text": {"$search": q}}
+
+def _search(col, q, offset, limit):
+    """
+    Internal search function
     
-    # Check if user is admin
-    if not await is_check_admin(client, chat_id, user_id):
-        return await message.reply(
-            "❌ <b>Admin Only!</b>\n\n"
-            "Only group admins can use this command.",
-            parse_mode=enums.ParseMode.HTML
+    Returns:
+        (documents, total_count)
+    """
+    try:
+        cursor = (
+            col.find(
+                _text_filter(q),
+                {
+                    "file_name": 1,
+                    "file_size": 1,
+                    "caption": 1,
+                    "score": {"$meta": "textScore"}
+                }
+            )
+            .sort([("score", {"$meta": "textScore"})])
+            .skip(offset)
+            .limit(limit)
         )
+        docs = list(cursor)
+        count = col.count_documents(_text_filter(q))
+        return docs, count
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return [], 0
+
+# ─────────────────────────────────────────
+# 🚀 PUBLIC SEARCH API (ULTRA FAST CASCADE)
+# ─────────────────────────────────────────
+async def get_search_results(
+    query,
+    max_results=MAX_BTN,
+    offset=0,
+    lang=None,
+    collection_type="primary"
+):
+    """
+    Main search function with intelligent cascade
     
-    # Get command argument
-    if len(message.command) < 2:
-        settings = await get_settings(chat_id)
-        current_status = "✅ ON" if settings.get("search_enabled", True) else "❌ OFF"
+    Args:
+        query: Search query string
+        max_results: Maximum results to return
+        offset: Pagination offset
+        lang: Language filter (optional)
+        collection_type: "primary", "cloud", "archive", or "all"
+    
+    Returns:
+        (results, next_offset, total)
+    """
+    if not query or not query.strip():
+        return [], "", 0
+    
+    query = normalize_query(query)
+    if not query:
+        return [], "", 0
+    
+    prefix = prefix_query(query)
+
+    results = []
+    total = 0
+
+    # ⚡ CASCADE SEARCH: Primary → Cloud → Archive
+    # Only searches next collection if previous returns 0 results
+    if collection_type == "all":
+        # 1️⃣ Try Primary first
+        docs, cnt = _search(primary, query, offset, max_results)
+        results.extend(docs)
+        total += cnt
         
-        return await message.reply(
-            f"🔍 <b>Group Search Settings</b>\n\n"
-            f"Current Status: {current_status}\n\n"
-            f"<b>Usage:</b>\n"
-            f"• <code>/search on</code> - Enable search\n"
-            f"• <code>/search off</code> - Disable search\n\n"
-            f"<b>Note:</b> When OFF, nobody (including premium users) can search in this group.",
-            parse_mode=enums.ParseMode.HTML
-        )
+        # 2️⃣ If Primary has 0 results, try Cloud
+        if not results:
+            docs, cnt = _search(cloud, query, offset, max_results)
+            results.extend(docs)
+            total += cnt
+            
+            # 3️⃣ If Cloud also has 0 results, try Archive
+            if not results:
+                docs, cnt = _search(archive, query, offset, max_results)
+                results.extend(docs)
+                total += cnt
+                
+                # 4️⃣ If still no results, try prefix fallback in all collections
+                if not results and prefix:
+                    docs, cnt = _search(primary, prefix, 0, max_results)
+                    if docs:
+                        results.extend(docs)
+                        total += cnt
+                    else:
+                        docs, cnt = _search(cloud, prefix, 0, max_results)
+                        if docs:
+                            results.extend(docs)
+                            total += cnt
+                        else:
+                            docs, cnt = _search(archive, prefix, 0, max_results)
+                            results.extend(docs)
+                            total += cnt
     
-    action = message.command[1].lower()
-    
-    if action == "on":
-        await save_group_settings(chat_id, "search_enabled", True)
-        await message.reply(
-            "✅ <b>Search Enabled!</b>\n\n"
-            "All premium users can now search in this group.",
-            parse_mode=enums.ParseMode.HTML
-        )
-    
-    elif action == "off":
-        await save_group_settings(chat_id, "search_enabled", False)
-        await message.reply(
-            "❌ <b>Search Disabled!</b>\n\n"
-            "Nobody can search in this group now.\n"
-            "Use <code>/search on</code> to re-enable.",
-            parse_mode=enums.ParseMode.HTML
-        )
+    # Single collection search (old behavior)
+    elif collection_type in COLLECTIONS:
+        col = COLLECTIONS[collection_type]
+        
+        # Main search
+        docs, cnt = _search(col, query, offset, max_results)
+        results.extend(docs)
+        total += cnt
+        
+        # Prefix fallback if no results
+        if not results and prefix:
+            docs, cnt = _search(col, prefix, 0, max_results)
+            results.extend(docs)
+            total += cnt
     
     else:
-        await message.reply(
-            "❌ <b>Invalid Option!</b>\n\n"
-            "Use: <code>/search on</code> or <code>/search off</code>",
-            parse_mode=enums.ParseMode.HTML
-        )
+        # Invalid collection type, default to primary
+        docs, cnt = _search(primary, query, offset, max_results)
+        results.extend(docs)
+        total += cnt
 
+    # 5️⃣ LANG FILTER (VERY SMALL LOOP)
+    if lang and results:
+        lang = lang.lower()
+        results = [f for f in results if lang in f["file_name"].lower()]
+        total = len(results)
 
-# ─────────────────────────────────────────────
-# 🔁 NAVIGATION (PREV/NEXT)
-# ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^nav_"))
-async def navigate_page(bot, query):
+    # Calculate next offset
+    next_offset = offset + max_results
+    if next_offset >= total:
+        next_offset = ""
+
+    # ✅ Return which collection actually had results
+    actual_source = collection_type
+    if collection_type == "all" and results:
+        # Detect which collection the results came from
+        if total > 0:
+            # Check first result's _id in each collection to find source
+            first_id = results[0]["_id"]
+            if primary.find_one({"_id": first_id}):
+                actual_source = "primary"
+            elif cloud.find_one({"_id": first_id}):
+                actual_source = "cloud"
+            elif archive.find_one({"_id": first_id}):
+                actual_source = "archive"
+
+    return results, next_offset, total, actual_source
+
+# ─────────────────────────────────────────
+# 🗑 DELETE FILES (WITH LOGGING) ✅
+# ─────────────────────────────────────────
+async def delete_files(query, collection_type="all"):
+    """
+    Delete files from database
+    
+    Args:
+        query: File name to search (use "*" for all files)
+        collection_type: "primary", "cloud", "archive", or "all"
+    
+    Returns:
+        Number of deleted files
+    """
+    deleted = 0
+    
     try:
-        _, req, key, offset, collection_type = query.data.split("_", 4)
-        req = int(req)
-        offset = int(offset)
-    except:
-        return await query.answer("Invalid request!", show_alert=True)
+        # Special case: Delete ALL files
+        if query == "*":
+            for name, col in COLLECTIONS.items():
+                if collection_type != "all" and name != collection_type:
+                    continue
+                result = col.delete_many({})
+                deleted += result.deleted_count
+                logger.warning(f"⚠️ DELETED ALL {result.deleted_count} files from {name}")
+            return deleted
+        
+        # Normal case: Delete by query
+        query = normalize_query(query)
+        if not query:
+            logger.error("Empty query after normalization")
+            return 0
+        
+        flt = _text_filter(query)
 
-    if req != query.from_user.id:
-        return await query.answer("Not for you!", show_alert=True)
+        for name, col in COLLECTIONS.items():
+            if collection_type != "all" and name != collection_type:
+                continue
+            result = col.delete_many(flt)
+            deleted += result.deleted_count
+            if result.deleted_count > 0:
+                # ✅ DELETE LOG - Shows in Koyeb
+                logger.info(f"🗑️ Deleted {result.deleted_count} files matching '{query}' from {name}")
 
-    # ✅ Premium check for navigation
-    if IS_PREMIUM and not await is_premium(query.from_user.id, bot):
-        return await query.answer(
-            "❌ Premium subscription expired!\nUse /plan to renew.",
-            show_alert=True
-        )
-
-    search = BUTTONS.get(key)
-    if not search:
-        return await query.answer("Search expired!", show_alert=True)
-
-    # Get results
-    files, next_offset, total, actual_source = await get_search_results(
-        search,
-        max_results=MAX_BTN,
-        offset=offset,
-        collection_type=collection_type
-    )
+        return deleted
     
-    # Use actual source for display
-    collection_type = actual_source
-    
-    if not files:
-        return await query.answer("No more results!", show_alert=True)
-
-    temp.FILES[key] = files
-
-    # Build results
-    files_text = ""
-    for file in files:
-        files_text += (
-            f"📁 <a href='https://t.me/{temp.U_NAME}"
-            f"?start=file_{query.message.chat.id}_{file['_id']}'>"
-            f"[{get_size(file['file_size'])}] {file['file_name']}</a>\n\n"
-        )
-
-    # Calculate pages
-    current_page = (offset // MAX_BTN) + 1
-    total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
-
-    cap = (
-        f"<b>👑 Search: {search}\n"
-        f"🎬 Total: {total}\n"
-        f"📚 Source: {collection_type.upper()}\n"
-        f"📄 Page: {current_page}/{total_pages}</b>\n\n"
-    )
-
-    # Build buttons
-    buttons = []
-    
-    # Navigation row
-    nav_row = []
-    prev_offset = offset - MAX_BTN
-    
-    if prev_offset >= 0:
-        nav_row.append(
-            InlineKeyboardButton("« ᴘʀᴇᴠ", callback_data=f"nav_{req}_{key}_{prev_offset}_{collection_type}")
-        )
-    
-    nav_row.append(
-        InlineKeyboardButton(f"📄 {current_page}/{total_pages}", callback_data="pages")
-    )
-    
-    if next_offset:
-        nav_row.append(
-            InlineKeyboardButton("ɴᴇxᴛ »", callback_data=f"nav_{req}_{key}_{next_offset}_{collection_type}")
-        )
-    
-    buttons.append(nav_row)
-
-    # Collection row - ALWAYS SHOW
-    coll_row = []
-    for coll in ["primary", "cloud", "archive"]:
-        emoji = "✅" if coll == collection_type else "📂"
-        coll_row.append(
-            InlineKeyboardButton(
-                f"{emoji} {coll.upper()[:3]}",
-                callback_data=f"coll_{req}_{key}_{coll}"
-            )
-        )
-    buttons.append(coll_row)
-
-    # Close button
-    buttons.append([InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")])
-
-    try:
-        await query.message.edit_text(
-            cap + files_text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-            disable_web_page_preview=True,
-            parse_mode=enums.ParseMode.HTML
-        )
     except Exception as e:
-        # Ignore "message not modified" errors
-        if "MESSAGE_NOT_MODIFIED" not in str(e):
-            raise
+        logger.error(f"Error deleting files: {e}")
+        return deleted
+
+# ─────────────────────────────────────────
+# 📂 FILE DETAILS
+# ─────────────────────────────────────────
+async def get_file_details(file_id):
+    """
+    Get file details by file_id
     
-    await query.answer()
-
-
-# ─────────────────────────────────────────────
-# 🗂️ COLLECTION SWITCH
-# ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^coll_"))
-async def switch_collection(bot, query):
+    Args:
+        file_id: Unique file identifier
+    
+    Returns:
+        File document or None
+    """
     try:
-        _, req, key, collection_type = query.data.split("_", 3)
-        req = int(req)
-    except:
-        return await query.answer("Invalid request!", show_alert=True)
-
-    if req != query.from_user.id:
-        return await query.answer("Not for you!", show_alert=True)
-
-    # ✅ Premium check for collection switch
-    if IS_PREMIUM and not await is_premium(query.from_user.id, bot):
-        return await query.answer(
-            "❌ Premium subscription expired!\nUse /plan to renew.",
-            show_alert=True
-        )
-
-    search = BUTTONS.get(key)
-    if not search:
-        return await query.answer("Search expired!", show_alert=True)
-
-    # Search in new collection from start
-    files, next_offset, total, actual_source = await get_search_results(
-        search,
-        max_results=MAX_BTN,
-        offset=0,
-        collection_type=collection_type
-    )
-    
-    # Use actual source for display
-    collection_type = actual_source
-    
-    if not files:
-        return await query.answer(f"No results in {collection_type.upper()}!", show_alert=True)
-
-    temp.FILES[key] = files
-
-    # Build results
-    files_text = ""
-    for file in files:
-        files_text += (
-            f"📁 <a href='https://t.me/{temp.U_NAME}"
-            f"?start=file_{query.message.chat.id}_{file['_id']}'>"
-            f"[{get_size(file['file_size'])}] {file['file_name']}</a>\n\n"
-        )
-
-    total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
-
-    cap = (
-        f"<b>👑 Search: {search}\n"
-        f"🎬 Total: {total}\n"
-        f"📚 Source: {collection_type.upper()}\n"
-        f"📄 Page: 1/{total_pages}</b>\n\n"
-    )
-
-    # Build buttons
-    buttons = []
-    
-    # Navigation row
-    nav_row = [InlineKeyboardButton(f"📄 1/{total_pages}", callback_data="pages")]
-    
-    if next_offset:
-        nav_row.append(
-            InlineKeyboardButton("ɴᴇxᴛ »", callback_data=f"nav_{req}_{key}_{next_offset}_{collection_type}")
-        )
-    
-    buttons.append(nav_row)
-
-    # Collection row - ALWAYS SHOW
-    coll_row = []
-    for coll in ["primary", "cloud", "archive"]:
-        emoji = "✅" if coll == collection_type else "📂"
-        coll_row.append(
-            InlineKeyboardButton(
-                f"{emoji} {coll.upper()[:3]}",
-                callback_data=f"coll_{req}_{key}_{coll}"
-            )
-        )
-    buttons.append(coll_row)
-
-    # Close button
-    buttons.append([InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")])
-
-    try:
-        await query.message.edit_text(
-            cap + files_text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-            disable_web_page_preview=True,
-            parse_mode=enums.ParseMode.HTML
-        )
-        await query.answer(f"Switched to {collection_type.upper()}! 🔄")
+        for col in COLLECTIONS.values():
+            doc = col.find_one({"_id": file_id})
+            if doc:
+                return doc
+        return None
     except Exception as e:
-        if "MESSAGE_NOT_MODIFIED" not in str(e):
-            await query.answer("Failed to switch!", show_alert=True)
+        logger.error(f"Error getting file details: {e}")
+        return None
 
-
-# ─────────────────────────────────────────────
-# ❌ CLOSE & PAGE INFO
-# ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^close_data$"))
-async def close_cb(bot, query):
-    await query.message.delete()
-
-
-@Client.on_callback_query(filters.regex(r"^pages$"))
-async def pages_cb(bot, query):
-    await query.answer()
-
-
-# ─────────────────────────────────────────────
-# 🚀 AUTO FILTER CORE - ULTRA FAST
-# ─────────────────────────────────────────────
-async def auto_filter(client, msg, collection_type="all"):
-    message = msg
-    settings = await get_settings(message.chat.id)
-
-    search = message.text.strip()
+# ─────────────────────────────────────────
+# 🔁 MOVE FILES (WITH LOGGING) ✅
+# ─────────────────────────────────────────
+async def move_files(query, from_collection, to_collection):
+    """
+    Move files from one collection to another
     
-    # Ultra-fast direct search (NO intermediate message)
-    files, next_offset, total, actual_source = await get_search_results(
-        search,
-        max_results=MAX_BTN,
-        offset=0,
-        collection_type=collection_type
-    )
-
-    if not files:
-        k = await message.reply(f"❌ I can't find <b>{search}</b>")
-        await asyncio.sleep(5)
-        await k.delete()
-        return
-
-    key = f"{message.chat.id}-{message.id}"
-    temp.FILES[key] = files
-    BUTTONS[key] = search
-
-    # Build results
-    files_text = ""
-    for file in files:
-        files_text += (
-            f"📁 <a href='https://t.me/{temp.U_NAME}"
-            f"?start=file_{message.chat.id}_{file['_id']}'>"
-            f"[{get_size(file['file_size'])}] {file['file_name']}</a>\n\n"
-        )
-
-    total_pages = math.ceil(total / MAX_BTN) if total > 0 else 1
-
-    cap = (
-        f"<b>👑 Search: {search}\n"
-        f"🎬 Total: {total}\n"
-        f"📚 Source: {actual_source.upper()}\n"
-        f"📄 Page: 1/{total_pages}</b>\n\n"
-    )
-
-    # Build buttons
-    buttons = []
+    Args:
+        query: Search query to find files
+        from_collection: Source collection ("primary", "cloud", or "archive")
+        to_collection: Destination collection ("primary", "cloud", or "archive")
     
-    # Navigation row
-    nav_row = [InlineKeyboardButton(f"📄 1/{total_pages}", callback_data="pages")]
+    Returns:
+        Number of moved files
+    """
+    try:
+        query = normalize_query(query)
+        if not query:
+            logger.error("Empty query after normalization")
+            return 0
+        
+        src = COLLECTIONS.get(from_collection)
+        dst = COLLECTIONS.get(to_collection)
+        
+        if not src or not dst:
+            logger.error(f"Invalid collection names: {from_collection} -> {to_collection}")
+            return 0
+
+        moved = 0
+        for doc in src.find(_text_filter(query)):
+            try:
+                dst.insert_one(doc)
+                src.delete_one({"_id": doc["_id"]})
+                moved += 1
+            except DuplicateKeyError:
+                src.delete_one({"_id": doc["_id"]})
+                moved += 1
+            except Exception as e:
+                logger.error(f"Error moving file {doc['_id']}: {e}")
+
+        # ✅ MOVE LOG - Shows in Koyeb
+        if moved > 0:
+            logger.info(f"📦 Moved {moved} files from {from_collection} → {to_collection}")
+        
+        return moved
     
-    if next_offset:
-        nav_row.append(
-            InlineKeyboardButton("ɴᴇxᴛ »", callback_data=f"nav_{message.from_user.id}_{key}_{next_offset}_{actual_source}")
-        )
+    except Exception as e:
+        logger.error(f"Error in move_files: {e}")
+        return 0
+
+# ─────────────────────────────────────────
+# 📋 GET ALL FILES FROM COLLECTION
+# ─────────────────────────────────────────
+async def get_all_files(collection_type="primary", limit=100, skip=0):
+    """
+    Get all files from a specific collection
     
-    buttons.append(nav_row)
+    Args:
+        collection_type: "primary", "cloud", or "archive"
+        limit: Number of files to return
+        skip: Number of files to skip (for pagination)
+    
+    Returns:
+        List of file documents
+    """
+    try:
+        col = COLLECTIONS.get(collection_type, primary)
+        files = list(col.find().skip(skip).limit(limit))
+        return files
+    except Exception as e:
+        logger.error(f"Error getting all files: {e}")
+        return []
 
-    # Collection row - ALWAYS SHOW
-    coll_row = []
-    for coll in ["primary", "cloud", "archive"]:
-        emoji = "✅" if coll == actual_source else "📂"
-        coll_row.append(
-            InlineKeyboardButton(
-                f"{emoji} {coll.upper()[:3]}",
-                callback_data=f"coll_{message.from_user.id}_{key}_{coll}"
-            )
-        )
-    buttons.append(coll_row)
+# ─────────────────────────────────────────
+# 🔍 SEARCH BY FILE NAME (EXACT MATCH)
+# ─────────────────────────────────────────
+async def search_by_filename(filename, collection_type="primary"):
+    """
+    Search for files by exact filename match
+    
+    Args:
+        filename: Exact filename to search
+        collection_type: "primary", "cloud", "archive", or "all"
+    
+    Returns:
+        List of matching files
+    """
+    try:
+        results = []
+        
+        if collection_type in COLLECTIONS:
+            cols = [COLLECTIONS[collection_type]]
+        else:
+            cols = [primary, cloud, archive]
+        
+        for col in cols:
+            docs = list(col.find({"file_name": {"$regex": filename, "$options": "i"}}))
+            results.extend(docs)
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error in search_by_filename: {e}")
+        return []
 
-    # Close button
-    buttons.append([InlineKeyboardButton("❌ ᴄʟᴏsᴇ", callback_data="close_data")])
+# ─────────────────────────────────────────
+# 📊 GET COLLECTION STATS
+# ─────────────────────────────────────────
+async def get_collection_stats(collection_type="primary"):
+    """
+    Get detailed stats for a collection
+    
+    Returns:
+        Dictionary with stats
+    """
+    try:
+        col = COLLECTIONS.get(collection_type, primary)
+        total = col.estimated_document_count()
+        
+        # Get total size
+        pipeline = [
+            {"$group": {"_id": None, "total_size": {"$sum": "$file_size"}}}
+        ]
+        result = list(col.aggregate(pipeline))
+        total_size = result[0]["total_size"] if result else 0
+        
+        return {
+            "collection": collection_type,
+            "total_files": total,
+            "total_size": total_size
+        }
+    except Exception as e:
+        logger.error(f"Error getting collection stats: {e}")
+        return {"collection": collection_type, "total_files": 0, "total_size": 0}
 
-    # Send instantly
-    k = await message.reply(
-        cap + files_text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True,
-        parse_mode=enums.ParseMode.HTML
-    )
+# ─────────────────────────────────────────
+# 🔐 FILE ID UTILS
+# ─────────────────────────────────────────
+def encode_file_id(s: bytes) -> str:
+    """Encode file ID to base64"""
+    r, n = b"", 0
+    for i in s + bytes([22, 4]):
+        if i == 0:
+            n += 1
+        else:
+            if n:
+                r += b"\x00" + bytes([n])
+                n = 0
+            r += bytes([i])
+    return base64.urlsafe_b64encode(r).decode().rstrip("=")
 
-    # Auto-delete if enabled
-    if settings.get("auto_delete"):
-        await asyncio.sleep(DELETE_TIME)
-        await k.delete()
-        try:
-            await message.delete()
-        except:
-            pass
+def unpack_new_file_id(new_file_id):
+    """Unpack Telegram file ID"""
+    try:
+        d = FileId.decode(new_file_id)
+        return encode_file_id(pack(
+            "<iiqq",
+            int(d.file_type),
+            d.dc_id,
+            d.media_id,
+            d.access_hash
+        ))
+    except Exception as e:
+        logger.error(f"Error unpacking file ID: {e}")
+        return None
