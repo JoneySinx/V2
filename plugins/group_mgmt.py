@@ -355,6 +355,221 @@ async def blacklist_filter(client, message):
             return
 
 # =========================
+# CONNECTION SYSTEM (MANAGE FROM DM)
+# =========================
+
+# Store active connections: {user_id: chat_id}
+CONNECTIONS = {}
+
+@Client.on_message(filters.command("connect"))
+async def connect_chat(client, message):
+    """
+    Connect to a group for remote management
+    Usage: 
+      /connect (in group) - Get connection button
+      /connect <chat_id> (in DM) - Connect to group
+    """
+    user_id = message.from_user.id
+    
+    # If used in group
+    if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        chat_id = message.chat.id
+        
+        # Check if user is admin
+        if not await is_admin(client, chat_id, user_id):
+            return await message.reply("❌ Admin only command!")
+        
+        chat = await client.get_chat(chat_id)
+        chat_name = chat.title
+        
+        await message.reply(
+            f"🔗 **Connect to Group**\n\n"
+            f"**Group:** {chat_name}\n"
+            f"**Chat ID:** `{chat_id}`\n\n"
+            f"**To connect from DM:**\n"
+            f"1. Start bot in DM: @{(await client.get_me()).username}\n"
+            f"2. Send: `/connect {chat_id}`\n\n"
+            f"**Or click button below:**",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔗 Connect in DM",
+                    url=f"https://t.me/{(await client.get_me()).username}?start=connect_{chat_id}"
+                )
+            ]])
+        )
+    
+    # If used in DM
+    elif message.chat.type == enums.ChatType.PRIVATE:
+        if len(message.command) < 2:
+            # Show connection status
+            if user_id in CONNECTIONS:
+                connected_chat_id = CONNECTIONS[user_id]
+                try:
+                    chat = await client.get_chat(connected_chat_id)
+                    await message.reply(
+                        f"✅ **Currently Connected**\n\n"
+                        f"**Group:** {chat.title}\n"
+                        f"**Chat ID:** `{connected_chat_id}`\n\n"
+                        f"Use `/disconnect` to disconnect"
+                    )
+                except:
+                    # Chat not accessible
+                    del CONNECTIONS[user_id]
+                    await message.reply(
+                        "❌ Connection expired or group not accessible.\n\n"
+                        "Use `/connect <chat_id>` to reconnect"
+                    )
+            else:
+                await message.reply(
+                    "📭 **Not Connected**\n\n"
+                    "**To connect:**\n"
+                    "1. Go to your group\n"
+                    "2. Send `/connect` there\n"
+                    "3. Get the chat ID\n"
+                    "4. Send `/connect <chat_id>` here\n\n"
+                    "**Or:** Use the connect button from group"
+                )
+            return
+        
+        # Connect to new group
+        try:
+            chat_id = int(message.command[1])
+        except:
+            return await message.reply("❌ Invalid chat ID! Use numeric ID only.")
+        
+        # Verify user is admin in that group
+        try:
+            if not await is_admin(client, chat_id, user_id):
+                return await message.reply(
+                    "❌ **Not Authorized!**\n\n"
+                    "You must be an admin in that group."
+                )
+        except Exception as e:
+            return await message.reply(
+                "❌ **Connection Failed!**\n\n"
+                f"Could not access group `{chat_id}`\n\n"
+                "**Possible reasons:**\n"
+                "• Invalid chat ID\n"
+                "• Bot not in that group\n"
+                "• You're not admin there"
+            )
+        
+        # Get chat info
+        try:
+            chat = await client.get_chat(chat_id)
+            chat_name = chat.title
+        except:
+            return await message.reply("❌ Could not get group info!")
+        
+        # Store connection
+        CONNECTIONS[user_id] = chat_id
+        
+        await message.reply(
+            f"✅ **Connected Successfully!**\n\n"
+            f"**Group:** {chat_name}\n"
+            f"**Chat ID:** `{chat_id}`\n\n"
+            f"🎯 You can now use all admin commands here:\n"
+            f"• `/filter`, `/save`, `/dlink`\n"
+            f"• `/notes`, `/filters`, `/dlinklist`\n"
+            f"• `/addblacklist`, `/blacklist`\n"
+            f"• And more!\n\n"
+            f"Use `/disconnect` to disconnect"
+        )
+
+@Client.on_message(filters.command("disconnect") & filters.private)
+async def disconnect_chat(client, message):
+    """
+    Disconnect from current group
+    Usage: /disconnect (in DM)
+    """
+    user_id = message.from_user.id
+    
+    if user_id not in CONNECTIONS:
+        return await message.reply(
+            "📭 **Not Connected**\n\n"
+            "You're not connected to any group."
+        )
+    
+    chat_id = CONNECTIONS[user_id]
+    
+    try:
+        chat = await client.get_chat(chat_id)
+        chat_name = chat.title
+    except:
+        chat_name = "Unknown Group"
+    
+    del CONNECTIONS[user_id]
+    
+    await message.reply(
+        f"✅ **Disconnected!**\n\n"
+        f"**Group:** {chat_name}\n"
+        f"**Chat ID:** `{chat_id}`\n\n"
+        f"Use `/connect` in group to reconnect"
+    )
+
+@Client.on_message(filters.command("connection") & filters.private)
+async def connection_status(client, message):
+    """
+    Show connection status
+    Usage: /connection (in DM)
+    """
+    user_id = message.from_user.id
+    
+    if user_id not in CONNECTIONS:
+        return await message.reply(
+            "📭 **Not Connected**\n\n"
+            "Use `/connect <chat_id>` to connect to a group"
+        )
+    
+    chat_id = CONNECTIONS[user_id]
+    
+    try:
+        chat = await client.get_chat(chat_id)
+        
+        # Get group stats
+        data = await db.get_settings(chat_id) or {}
+        notes_count = len(data.get("notes", {}))
+        filters_count = len(data.get("filters", {}))
+        blacklist_count = len(data.get("blacklist", []))
+        dlink_count = len(data.get("dlink", {}))
+        
+        await message.reply(
+            f"🔗 **Connection Status**\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"**Group:** {chat.title}\n"
+            f"**Chat ID:** `{chat_id}`\n"
+            f"**Username:** @{chat.username or 'None'}\n\n"
+            f"📊 **Statistics:**\n"
+            f"├ Notes: {notes_count}\n"
+            f"├ Filters: {filters_count}\n"
+            f"├ Blacklist: {blacklist_count}\n"
+            f"└ Dlinks: {dlink_count}\n\n"
+            f"✅ **Status:** Connected\n"
+            f"⏰ {get_ist_time()} IST"
+        )
+    except:
+        del CONNECTIONS[user_id]
+        await message.reply(
+            "❌ Connection expired or group not accessible.\n\n"
+            "Use `/connect <chat_id>` to reconnect"
+        )
+
+# Helper function to get chat_id (from connection or message)
+def get_target_chat_id(message):
+    """Get target chat_id - either from connection (DM) or current chat (group)"""
+    user_id = message.from_user.id
+    
+    # If in group, use group chat_id
+    if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        return message.chat.id
+    
+    # If in DM, use connected chat_id
+    if message.chat.type == enums.ChatType.PRIVATE:
+        return CONNECTIONS.get(user_id)
+    
+    return None
+
+# =========================
 # FILTERS SYSTEM (AUTO REPLY)
 # =========================
 
@@ -448,7 +663,7 @@ async def add_filter(client, message):
         filter_caption = ""
     
     # Save to database
-    data = await db.get_settings(message.chat.id) or {}
+    data = await db.get_settings(chat_id) or {}
     filters = data.get("filters", {})
     
     filters[keyword] = {
@@ -460,13 +675,23 @@ async def add_filter(client, message):
     }
     
     data["filters"] = filters
-    await db.update_settings(message.chat.id, data)
+    await db.update_settings(chat_id, data)
     
     # Show keyword with quotes if it has spaces
     display_keyword = f'"{keyword}"' if " " in keyword else keyword
     
+    # Get chat info if in DM
+    chat_info = ""
+    if message.chat.type == enums.ChatType.PRIVATE:
+        try:
+            chat = await client.get_chat(chat_id)
+            chat_info = f"**Group:** {chat.title}\n"
+        except:
+            pass
+    
     await message.reply(
         f"✅ **Filter Added!**\n\n"
+        f"{chat_info}"
         f"**Keyword:** `{display_keyword}`\n"
         f"**Type:** {filter_type.title()}\n"
         f"**Added by:** {message.from_user.mention}\n"
