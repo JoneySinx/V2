@@ -2,23 +2,21 @@ import logging
 import re
 import base64
 from struct import pack
-
+import motor.motor_asyncio
 from hydrogram.file_id import FileId
-from pymongo import MongoClient, TEXT
 from pymongo.errors import DuplicateKeyError
-
-from info import USE_CAPTION_FILTER, DATABASE_URL, DATABASE_NAME, MAX_BTN
+from info import DATABASE_URL, DATABASE_NAME, MAX_BTN
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# ⚙️ MONGODB CONNECTION (POOL OPTIMIZED)
+# ⚙️ MOTOR ASYNC CONNECTION (NON-BLOCKING)
 # ─────────────────────────────────────────
-client = MongoClient(
+client = motor.motor_asyncio.AsyncIOMotorClient(
     DATABASE_URL,
-    maxPoolSize=50,
+    maxPoolSize=50,       # Koyeb के लिए बेस्ट
     minPoolSize=10,
-    maxIdleTimeMS=45000
+    serverSelectionTimeoutMS=5000
 )
 db = client[DATABASE_NAME]
 
@@ -33,24 +31,23 @@ COLLECTIONS = {
 }
 
 # ─────────────────────────────────────────
-# ⚡ INDEXES (ABSOLUTE MUST)
+# ⚡ INDEXES (BACKGROUND)
 # ─────────────────────────────────────────
-def ensure_indexes():
+async def ensure_indexes():
     """Create text indexes for fast search"""
     for name, col in COLLECTIONS.items():
         try:
-            col.create_index(
-                [("file_name", TEXT), ("caption", TEXT)],
-                name=f"{name}_text"
+            # TEXT index search के लिए जरूरी है
+            await col.create_index(
+                [("file_name", "text"), ("caption", "text")],
+                name=f"{name}_text",
+                background=True  # बोट को रोके बिना इंडेक्स बनाएगा
             )
-            # Silent - no logs for index creation
         except Exception as e:
             logger.error(f"Index creation failed for {name}: {e}")
 
-ensure_indexes()
-
 # ─────────────────────────────────────────
-# 🧠 FAST NORMALIZER (NO CPU COST)
+# 🧠 FAST NORMALIZER
 # ─────────────────────────────────────────
 REPLACEMENTS = str.maketrans({
     "0": "o", "1": "i", "3": "e",
@@ -58,24 +55,24 @@ REPLACEMENTS = str.maketrans({
 })
 
 def normalize_query(q: str) -> str:
-    """Normalize search query for better results"""
+    """Normalize search query"""
     q = q.lower().translate(REPLACEMENTS)
     q = re.sub(r"[^a-z0-9\s]", " ", q)
     return re.sub(r"\s+", " ", q).strip()
 
 def prefix_query(q: str) -> str:
-    """Create prefix query for fallback search"""
+    """Create prefix query for fallback"""
     return " ".join(w[:4] for w in q.split() if len(w) >= 3)
 
 # ─────────────────────────────────────────
-# 📊 DB STATS (FAST)
+# 📊 DB STATS (ASYNC)
 # ─────────────────────────────────────────
-def db_count_documents():
-    """Get document counts from all collections"""
+async def db_count_documents():
+    """Get document counts"""
     try:
-        p = primary.estimated_document_count()
-        c = cloud.estimated_document_count()
-        a = archive.estimated_document_count()
+        p = await primary.estimated_document_count()
+        c = await cloud.estimated_document_count()
+        a = await archive.estimated_document_count()
         return {
             "primary": p,
             "cloud": c,
@@ -87,430 +84,196 @@ def db_count_documents():
         return {"primary": 0, "cloud": 0, "archive": 0, "total": 0}
 
 # ─────────────────────────────────────────
-# 💾 SAVE FILE (FAST & SAFE)
+# 💾 SAVE FILE (ASYNC)
 # ─────────────────────────────────────────
 async def save_file(media, collection_type="primary"):
-    """
-    Save file to database
-    
-    Args:
-        media: File object with file_id, file_name, caption, file_size
-        collection_type: "primary", "cloud", or "archive"
-    
-    Returns:
-        "suc" on success, "dup" if duplicate
-    """
     try:
         file_id = unpack_new_file_id(media.file_id)
+        
+        # क्लीन नाम और कैप्शन
+        f_name = re.sub(r"@\w+", "", media.file_name or "").strip()
+        caption = re.sub(r"@\w+", "", media.caption or "").strip()
 
         doc = {
             "_id": file_id,
-            "file_name": re.sub(r"@\w+", "", media.file_name or "").strip(),
-            "caption": re.sub(r"@\w+", "", media.caption or "").strip(),
+            "file_name": f_name,
+            "caption": caption,
             "file_size": media.file_size
         }
 
         col = COLLECTIONS.get(collection_type, primary)
-
-        col.insert_one(doc)
-        # Silent - no logs for file save
+        await col.insert_one(doc)
         return "suc"
     except DuplicateKeyError:
-        # Silent - no logs for duplicate
         return "dup"
     except Exception as e:
         logger.error(f"Error saving file: {e}")
         return "err"
 
 # ─────────────────────────────────────────
-# 🔍 ULTRA FAST SEARCH CORE
+# 🔍 ULTRA FAST SEARCH CORE (ASYNC)
 # ─────────────────────────────────────────
 def _text_filter(q):
-    """Create MongoDB text search filter"""
     return {"$text": {"$search": q}}
 
-def _search(col, q, offset, limit):
-    """
-    Internal search function
-    
-    Returns:
-        (documents, total_count)
-    """
+async def _search(col, q, offset, limit):
     try:
-        cursor = (
-            col.find(
-                _text_filter(q),
-                {
-                    "file_name": 1,
-                    "file_size": 1,
-                    "caption": 1,
-                    "score": {"$meta": "textScore"}
-                }
-            )
-            .sort([("score", {"$meta": "textScore"})])
-            .skip(offset)
-            .limit(limit)
+        # Motor cursor usage
+        cursor = col.find(
+            _text_filter(q),
+            {
+                "file_name": 1,
+                "file_size": 1,
+                "caption": 1,
+                "score": {"$meta": "textScore"}
+            }
         )
-        docs = list(cursor)
-        count = col.count_documents(_text_filter(q))
+        cursor.sort([("score", {"$meta": "textScore"})])
+        cursor.skip(offset).limit(limit)
+        
+        docs = await cursor.to_list(length=limit)
+        count = await col.count_documents(_text_filter(q))
         return docs, count
     except Exception as e:
         logger.error(f"Search error: {e}")
         return [], 0
 
 # ─────────────────────────────────────────
-# 🚀 PUBLIC SEARCH API (ULTRA FAST CASCADE)
+# 🚀 PUBLIC SEARCH API (ASYNC CASCADE)
 # ─────────────────────────────────────────
-async def get_search_results(
-    query,
-    max_results=MAX_BTN,
-    offset=0,
-    lang=None,
-    collection_type="primary"
-):
-    """
-    Main search function with intelligent cascade
-    
-    Args:
-        query: Search query string
-        max_results: Maximum results to return
-        offset: Pagination offset
-        lang: Language filter (optional)
-        collection_type: "primary", "cloud", "archive", or "all"
-    
-    Returns:
-        (results, next_offset, total)
-    """
+async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, collection_type="primary"):
     if not query or not query.strip():
-        return [], "", 0
+        return [], "", 0, collection_type
     
     query = normalize_query(query)
     if not query:
-        return [], "", 0
+        return [], "", 0, collection_type
     
     prefix = prefix_query(query)
-
     results = []
     total = 0
+    actual_source = collection_type
 
-    # ⚡ CASCADE SEARCH: Primary → Cloud → Archive
-    # Only searches next collection if previous returns 0 results
+    # ⚡ ASYNC CASCADE SEARCH: Primary → Cloud → Archive
     if collection_type == "all":
-        # 1️⃣ Try Primary first
-        docs, cnt = _search(primary, query, offset, max_results)
-        results.extend(docs)
-        total += cnt
-        
-        # 2️⃣ If Primary has 0 results, try Cloud
-        if not results:
-            docs, cnt = _search(cloud, query, offset, max_results)
+        # 1. Primary
+        docs, cnt = await _search(primary, query, offset, max_results)
+        if docs:
             results.extend(docs)
             total += cnt
-            
-            # 3️⃣ If Cloud also has 0 results, try Archive
-            if not results:
-                docs, cnt = _search(archive, query, offset, max_results)
+            actual_source = "primary"
+        
+        # 2. Cloud (If primary failed)
+        if not results:
+            docs, cnt = await _search(cloud, query, offset, max_results)
+            if docs:
                 results.extend(docs)
                 total += cnt
+                actual_source = "cloud"
+            
+            # 3. Archive (If cloud failed)
+            if not results:
+                docs, cnt = await _search(archive, query, offset, max_results)
+                if docs:
+                    results.extend(docs)
+                    total += cnt
+                    actual_source = "archive"
                 
-                # 4️⃣ If still no results, try prefix fallback in all collections
+                # 4. Fallback (Prefix Search)
                 if not results and prefix:
-                    docs, cnt = _search(primary, prefix, 0, max_results)
-                    if docs:
-                        results.extend(docs)
-                        total += cnt
-                    else:
-                        docs, cnt = _search(cloud, prefix, 0, max_results)
+                    for col_name, col in [("primary", primary), ("cloud", cloud), ("archive", archive)]:
+                        docs, cnt = await _search(col, prefix, 0, max_results)
                         if docs:
                             results.extend(docs)
                             total += cnt
-                        else:
-                            docs, cnt = _search(archive, prefix, 0, max_results)
-                            results.extend(docs)
-                            total += cnt
-    
-    # Single collection search (old behavior)
+                            actual_source = col_name
+                            break
+
+    # Single Collection Search
     elif collection_type in COLLECTIONS:
         col = COLLECTIONS[collection_type]
-        
-        # Main search
-        docs, cnt = _search(col, query, offset, max_results)
+        docs, cnt = await _search(col, query, offset, max_results)
         results.extend(docs)
         total += cnt
         
-        # Prefix fallback if no results
         if not results and prefix:
-            docs, cnt = _search(col, prefix, 0, max_results)
+            docs, cnt = await _search(col, prefix, 0, max_results)
             results.extend(docs)
             total += cnt
-    
+            
     else:
-        # Invalid collection type, default to primary
-        docs, cnt = _search(primary, query, offset, max_results)
+        # Default fallback
+        docs, cnt = await _search(primary, query, offset, max_results)
         results.extend(docs)
         total += cnt
 
-    # 5️⃣ LANG FILTER (VERY SMALL LOOP)
+    # 5. Language Filter
     if lang and results:
         lang = lang.lower()
         results = [f for f in results if lang in f["file_name"].lower()]
         total = len(results)
 
-    # Calculate next offset
     next_offset = offset + max_results
     if next_offset >= total:
         next_offset = ""
 
-    # ✅ Return which collection actually had results
-    actual_source = collection_type
-    if collection_type == "all" and results:
-        # Detect which collection the results came from
-        if total > 0:
-            # Check first result's _id in each collection to find source
-            first_id = results[0]["_id"]
-            if primary.find_one({"_id": first_id}):
-                actual_source = "primary"
-            elif cloud.find_one({"_id": first_id}):
-                actual_source = "cloud"
-            elif archive.find_one({"_id": first_id}):
-                actual_source = "archive"
-
     return results, next_offset, total, actual_source
 
 # ─────────────────────────────────────────
-# 🗑 DELETE FILES (WITH LOGGING) ✅
+# 🗑 DELETE FILES (ASYNC)
 # ─────────────────────────────────────────
 async def delete_files(query, collection_type="all"):
-    """
-    Delete files from database
-    
-    Args:
-        query: File name to search (use "*" for all files)
-        collection_type: "primary", "cloud", "archive", or "all"
-    
-    Returns:
-        Number of deleted files
-    """
     deleted = 0
-    
     try:
-        # Special case: Delete ALL files
         if query == "*":
             for name, col in COLLECTIONS.items():
-                if collection_type != "all" and name != collection_type:
-                    continue
-                result = col.delete_many({})
-                deleted += result.deleted_count
-                logger.warning(f"⚠️ DELETED ALL {result.deleted_count} files from {name}")
+                if collection_type != "all" and name != collection_type: continue
+                res = await col.delete_many({})
+                deleted += res.deleted_count
             return deleted
         
-        # Normal case: Delete by query
         query = normalize_query(query)
-        if not query:
-            logger.error("Empty query after normalization")
-            return 0
+        if not query: return 0
         
         flt = _text_filter(query)
-
         for name, col in COLLECTIONS.items():
-            if collection_type != "all" and name != collection_type:
-                continue
-            result = col.delete_many(flt)
-            deleted += result.deleted_count
-            if result.deleted_count > 0:
-                # ✅ DELETE LOG - Shows in Koyeb
-                logger.info(f"🗑️ Deleted {result.deleted_count} files matching '{query}' from {name}")
+            if collection_type != "all" and name != collection_type: continue
+            res = await col.delete_many(flt)
+            deleted += res.deleted_count
+            if res.deleted_count > 0:
+                logger.info(f"🗑️ Deleted {res.deleted_count} from {name}")
 
         return deleted
-    
     except Exception as e:
-        logger.error(f"Error deleting files: {e}")
+        logger.error(f"Error deleting: {e}")
         return deleted
 
 # ─────────────────────────────────────────
-# 📂 FILE DETAILS
+# 📂 FILE DETAILS & UTILS (ASYNC)
 # ─────────────────────────────────────────
 async def get_file_details(file_id):
-    """
-    Get file details by file_id
-    
-    Args:
-        file_id: Unique file identifier
-    
-    Returns:
-        File document or None
-    """
     try:
         for col in COLLECTIONS.values():
-            doc = col.find_one({"_id": file_id})
-            if doc:
-                return doc
+            doc = await col.find_one({"_id": file_id})
+            if doc: return doc
         return None
-    except Exception as e:
-        logger.error(f"Error getting file details: {e}")
+    except Exception:
         return None
 
-# ─────────────────────────────────────────
-# 🔁 MOVE FILES (WITH LOGGING) ✅
-# ─────────────────────────────────────────
-async def move_files(query, from_collection, to_collection):
-    """
-    Move files from one collection to another
-    
-    Args:
-        query: Search query to find files
-        from_collection: Source collection ("primary", "cloud", or "archive")
-        to_collection: Destination collection ("primary", "cloud", or "archive")
-    
-    Returns:
-        Number of moved files
-    """
-    try:
-        query = normalize_query(query)
-        if not query:
-            logger.error("Empty query after normalization")
-            return 0
-        
-        src = COLLECTIONS.get(from_collection)
-        dst = COLLECTIONS.get(to_collection)
-        
-        if not src or not dst:
-            logger.error(f"Invalid collection names: {from_collection} -> {to_collection}")
-            return 0
-
-        moved = 0
-        for doc in src.find(_text_filter(query)):
-            try:
-                dst.insert_one(doc)
-                src.delete_one({"_id": doc["_id"]})
-                moved += 1
-            except DuplicateKeyError:
-                src.delete_one({"_id": doc["_id"]})
-                moved += 1
-            except Exception as e:
-                logger.error(f"Error moving file {doc['_id']}: {e}")
-
-        # ✅ MOVE LOG - Shows in Koyeb
-        if moved > 0:
-            logger.info(f"📦 Moved {moved} files from {from_collection} → {to_collection}")
-        
-        return moved
-    
-    except Exception as e:
-        logger.error(f"Error in move_files: {e}")
-        return 0
-
-# ─────────────────────────────────────────
-# 📋 GET ALL FILES FROM COLLECTION
-# ─────────────────────────────────────────
-async def get_all_files(collection_type="primary", limit=100, skip=0):
-    """
-    Get all files from a specific collection
-    
-    Args:
-        collection_type: "primary", "cloud", or "archive"
-        limit: Number of files to return
-        skip: Number of files to skip (for pagination)
-    
-    Returns:
-        List of file documents
-    """
-    try:
-        col = COLLECTIONS.get(collection_type, primary)
-        files = list(col.find().skip(skip).limit(limit))
-        return files
-    except Exception as e:
-        logger.error(f"Error getting all files: {e}")
-        return []
-
-# ─────────────────────────────────────────
-# 🔍 SEARCH BY FILE NAME (EXACT MATCH)
-# ─────────────────────────────────────────
-async def search_by_filename(filename, collection_type="primary"):
-    """
-    Search for files by exact filename match
-    
-    Args:
-        filename: Exact filename to search
-        collection_type: "primary", "cloud", "archive", or "all"
-    
-    Returns:
-        List of matching files
-    """
-    try:
-        results = []
-        
-        if collection_type in COLLECTIONS:
-            cols = [COLLECTIONS[collection_type]]
-        else:
-            cols = [primary, cloud, archive]
-        
-        for col in cols:
-            docs = list(col.find({"file_name": {"$regex": filename, "$options": "i"}}))
-            results.extend(docs)
-        
-        return results
-    except Exception as e:
-        logger.error(f"Error in search_by_filename: {e}")
-        return []
-
-# ─────────────────────────────────────────
-# 📊 GET COLLECTION STATS
-# ─────────────────────────────────────────
-async def get_collection_stats(collection_type="primary"):
-    """
-    Get detailed stats for a collection
-    
-    Returns:
-        Dictionary with stats
-    """
-    try:
-        col = COLLECTIONS.get(collection_type, primary)
-        total = col.estimated_document_count()
-        
-        # Get total size
-        pipeline = [
-            {"$group": {"_id": None, "total_size": {"$sum": "$file_size"}}}
-        ]
-        result = list(col.aggregate(pipeline))
-        total_size = result[0]["total_size"] if result else 0
-        
-        return {
-            "collection": collection_type,
-            "total_files": total,
-            "total_size": total_size
-        }
-    except Exception as e:
-        logger.error(f"Error getting collection stats: {e}")
-        return {"collection": collection_type, "total_files": 0, "total_size": 0}
-
-# ─────────────────────────────────────────
-# 🔐 FILE ID UTILS
-# ─────────────────────────────────────────
+# --- File ID Encoding Utils (CPU bound, keep sync) ---
 def encode_file_id(s: bytes) -> str:
-    """Encode file ID to base64"""
     r, n = b"", 0
     for i in s + bytes([22, 4]):
-        if i == 0:
-            n += 1
+        if i == 0: n += 1
         else:
-            if n:
-                r += b"\x00" + bytes([n])
-                n = 0
+            if n: r += b"\x00" + bytes([n]); n = 0
             r += bytes([i])
     return base64.urlsafe_b64encode(r).decode().rstrip("=")
 
 def unpack_new_file_id(new_file_id):
-    """Unpack Telegram file ID"""
     try:
         d = FileId.decode(new_file_id)
-        return encode_file_id(pack(
-            "<iiqq",
-            int(d.file_type),
-            d.dc_id,
-            d.media_id,
-            d.access_hash
-        ))
-    except Exception as e:
-        logger.error(f"Error unpacking file ID: {e}")
+        return encode_file_id(pack("<iiqq", int(d.file_type), d.dc_id, d.media_id, d.access_hash))
+    except:
         return None
+
