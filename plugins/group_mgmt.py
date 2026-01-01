@@ -355,6 +355,302 @@ async def blacklist_filter(client, message):
             return
 
 # =========================
+# FILTERS SYSTEM (AUTO REPLY)
+# =========================
+
+@Client.on_message(filters.group & filters.command("filter"))
+async def add_filter(client, message):
+    """
+    Add auto-reply filter
+    Usage: 
+      /filter <keyword> <reply text>
+      /filter "ram jaane" <reply text> (for phrases with spaces)
+      or reply to a message with /filter <keyword>
+    """
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply("❌ Admin only command!")
+    
+    # Check if replying to a message
+    if message.reply_to_message:
+        if len(message.command) < 2:
+            return await message.reply(
+                "❌ **Invalid Usage!**\n\n"
+                "**Example:** Reply to a message with `/filter hello`"
+            )
+        
+        keyword = " ".join(message.command[1:]).lower().strip('"')
+        replied_msg = message.reply_to_message
+        
+        # Get filter content from replied message
+        if replied_msg.text:
+            filter_content = replied_msg.text
+            filter_type = "text"
+            filter_caption = ""
+        elif replied_msg.photo:
+            filter_content = replied_msg.photo.file_id
+            filter_type = "photo"
+            filter_caption = replied_msg.caption or ""
+        elif replied_msg.video:
+            filter_content = replied_msg.video.file_id
+            filter_type = "video"
+            filter_caption = replied_msg.caption or ""
+        elif replied_msg.document:
+            filter_content = replied_msg.document.file_id
+            filter_type = "document"
+            filter_caption = replied_msg.caption or ""
+        elif replied_msg.sticker:
+            filter_content = replied_msg.sticker.file_id
+            filter_type = "sticker"
+            filter_caption = ""
+        elif replied_msg.animation:
+            filter_content = replied_msg.animation.file_id
+            filter_type = "animation"
+            filter_caption = replied_msg.caption or ""
+        else:
+            return await message.reply("❌ Unsupported message type!")
+        
+    else:
+        # Save text filter from command
+        if len(message.command) < 3:
+            return await message.reply(
+                "❌ **Invalid Usage!**\n\n"
+                "**Examples:**\n"
+                "• `/filter hello Hello! Welcome to our group`\n"
+                "• `/filter \"ram jaane\" kya hai be` (for phrases)\n"
+                "• Reply to a message with `/filter hello`"
+            )
+        
+        # Parse keyword (handle quotes for phrases)
+        text_parts = message.text.split(None, 1)[1]  # Remove /filter
+        
+        # Check if keyword is in quotes
+        if text_parts.startswith('"'):
+            # Extract quoted keyword
+            quote_end = text_parts.find('"', 1)
+            if quote_end == -1:
+                return await message.reply("❌ Missing closing quote!")
+            
+            keyword = text_parts[1:quote_end].lower()
+            filter_content = text_parts[quote_end+1:].strip()
+            
+            if not filter_content:
+                return await message.reply("❌ Reply text is required!")
+        else:
+            # Normal single word keyword
+            parts = text_parts.split(None, 1)
+            if len(parts) < 2:
+                return await message.reply("❌ Reply text is required!")
+            
+            keyword = parts[0].lower()
+            filter_content = parts[1]
+        
+        filter_type = "text"
+        filter_caption = ""
+    
+    # Save to database
+    data = await db.get_settings(message.chat.id) or {}
+    filters = data.get("filters", {})
+    
+    filters[keyword] = {
+        "content": filter_content,
+        "type": filter_type,
+        "caption": filter_caption,
+        "added_by": message.from_user.id,
+        "added_at": get_ist_time()
+    }
+    
+    data["filters"] = filters
+    await db.update_settings(message.chat.id, data)
+    
+    # Show keyword with quotes if it has spaces
+    display_keyword = f'"{keyword}"' if " " in keyword else keyword
+    
+    await message.reply(
+        f"✅ **Filter Added!**\n\n"
+        f"**Keyword:** `{display_keyword}`\n"
+        f"**Type:** {filter_type.title()}\n"
+        f"**Added by:** {message.from_user.mention}\n"
+        f"⏰ {get_ist_time()} IST\n\n"
+        f"**Trigger:** Send a message containing `{display_keyword}`"
+    )
+
+@Client.on_message(filters.group & filters.command("filters"))
+async def list_filters(client, message):
+    """
+    List all filters
+    Usage: /filters
+    """
+    data = await db.get_settings(message.chat.id) or {}
+    filters_dict = data.get("filters", {})
+    
+    if not filters_dict:
+        return await message.reply(
+            "📭 **No Filters Saved**\n\n"
+            "Add your first filter with:\n"
+            "`/filter <keyword> <reply>`"
+        )
+    
+    # Build filters list
+    filters_text = "🎯 **Active Filters**\n" + "━" * 30 + "\n\n"
+    
+    for idx, (keyword, filter_data) in enumerate(filters_dict.items(), 1):
+        filter_type = filter_data["type"]
+        
+        # Get emoji for type
+        type_emoji = {
+            "text": "📄",
+            "photo": "🖼️",
+            "video": "🎥",
+            "document": "📎",
+            "sticker": "🎭",
+            "animation": "🎬"
+        }.get(filter_type, "📝")
+        
+        filters_text += f"{idx}. {type_emoji} `{keyword}` - {filter_type.title()}\n"
+    
+    filters_text += "\n" + "━" * 30
+    filters_text += f"\n**Total Filters:** {len(filters_dict)}"
+    filters_text += f"\n\n**Usage:** Just send a message containing the keyword"
+    filters_text += f"\n\n⏰ {get_ist_time()} IST"
+    
+    await message.reply(filters_text)
+
+@Client.on_message(filters.group & filters.command("stop"))
+async def delete_filter(client, message):
+    """
+    Delete a filter
+    Usage: /stop <keyword>
+    """
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply("❌ Admin only command!")
+    
+    if len(message.command) < 2:
+        return await message.reply(
+            "❌ **Invalid Usage!**\n\n"
+            "**Example:** `/stop hello`"
+        )
+    
+    keyword = message.command[1].lower()
+    
+    data = await db.get_settings(message.chat.id) or {}
+    filters_dict = data.get("filters", {})
+    
+    if keyword not in filters_dict:
+        return await message.reply(
+            f"❌ **Filter Not Found!**\n\n"
+            f"`{keyword}` filter doesn't exist."
+        )
+    
+    filters_dict.pop(keyword)
+    data["filters"] = filters_dict
+    await db.update_settings(message.chat.id, data)
+    
+    await message.reply(
+        f"🗑️ **Filter Deleted!**\n\n"
+        f"**Keyword:** `{keyword}`\n"
+        f"**Deleted by:** {message.from_user.mention}\n"
+        f"⏰ {get_ist_time()} IST"
+    )
+
+@Client.on_message(filters.group & filters.command("stopall"))
+async def delete_all_filters(client, message):
+    """
+    Delete all filters
+    Usage: /stopall confirm
+    """
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply("❌ Admin only command!")
+    
+    if len(message.command) < 2 or message.command[1].lower() != "confirm":
+        return await message.reply(
+            "⚠️ **Warning: This will delete ALL filters!**\n\n"
+            "To confirm, use:\n"
+            "`/stopall confirm`"
+        )
+    
+    data = await db.get_settings(message.chat.id) or {}
+    filters_count = len(data.get("filters", {}))
+    
+    data["filters"] = {}
+    await db.update_settings(message.chat.id, data)
+    
+    await message.reply(
+        f"🗑️ **All Filters Deleted!**\n\n"
+        f"**Total Deleted:** {filters_count}\n"
+        f"**Deleted by:** {message.from_user.mention}\n"
+        f"⏰ {get_ist_time()} IST"
+    )
+
+@Client.on_message(filters.group & filters.text, group=5)
+async def filter_handler(client, message):
+    """
+    Auto-reply when filter keyword is detected
+    Supports both single words and exact phrases (with quotes)
+    Priority: group=5 (runs before dlink handler)
+    """
+    # Skip if no text
+    if not message.text:
+        return
+    
+    # Skip commands
+    if message.text.startswith("/"):
+        return
+    
+    # Skip if admin typing filter commands
+    if message.text.startswith(("/filter", "/stop", "/filters", "/stopall")):
+        return
+    
+    data = await db.get_settings(message.chat.id) or {}
+    filters_dict = data.get("filters", {})
+    
+    if not filters_dict:
+        return
+    
+    text = message.text.lower()
+    
+    # Check for keyword match
+    for keyword, filter_data in filters_dict.items():
+        matched = False
+        
+        # Check if keyword has spaces (phrase)
+        if " " in keyword:
+            # Exact phrase match for multi-word keywords
+            if keyword in text:
+                matched = True
+        else:
+            # Word boundary match for single words
+            # This ensures "hi" matches "hi" or "hi there" but not "this"
+            import re
+            pattern = r'\b' + re.escape(keyword) + r'\b'
+            if re.search(pattern, text):
+                matched = True
+        
+        if matched:
+            filter_type = filter_data["type"]
+            filter_content = filter_data["content"]
+            filter_caption = filter_data.get("caption", "")
+            
+            try:
+                if filter_type == "text":
+                    await message.reply(filter_content)
+                elif filter_type == "photo":
+                    await message.reply_photo(filter_content, caption=filter_caption)
+                elif filter_type == "video":
+                    await message.reply_video(filter_content, caption=filter_caption)
+                elif filter_type == "document":
+                    await message.reply_document(filter_content, caption=filter_caption)
+                elif filter_type == "sticker":
+                    await message.reply_sticker(filter_content)
+                elif filter_type == "animation":
+                    await message.reply_animation(filter_content, caption=filter_caption)
+            except Exception as e:
+                # Silently fail if filter can't be sent
+                pass
+            
+            # Only reply to first matched filter
+            break
+
+# =========================
 # NOTES SYSTEM
 # =========================
 
