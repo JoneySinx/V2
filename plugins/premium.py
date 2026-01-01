@@ -199,7 +199,7 @@ async def prm_list(c, m):
     await msg.edit(text)
 
 # =========================
-# 🔘 CALLBACKS (FIXED & DEBUGGED)
+# 🔘 CALLBACKS
 # =========================
 
 @Client.on_callback_query(filters.regex("^buy_prem$"))
@@ -212,7 +212,7 @@ async def buy_callback(c, q):
     )
     
     try:
-        # 1. Listen for Days
+        # 1. Listen for Days (Text)
         resp = await c.listen(q.message.chat.id, timeout=60)
         try:
             days = int(resp.text)
@@ -236,9 +236,12 @@ async def buy_callback(c, q):
         try: os.remove(path)
         except: pass
         
-        # 3. Receipt Listener (FIXED)
-        # Added traceback to catch hidden errors
-        receipt = await c.listen(q.message.chat.id, filters.photo, timeout=300)
+        # 3. Receipt Listener (FIXED: Removing filter to prevent KeyError)
+        # We listen for ANY message, then check if it is a photo manually.
+        receipt = await c.listen(q.message.chat.id, timeout=300)
+        
+        if not receipt.photo:
+            return await q.message.reply("❌ **Invalid!** Please send a photo/screenshot.")
         
         # 4. Forward to Admin
         cap = f"#Payment\n👤: {q.from_user.mention} (`{q.from_user.id}`)\n💰: ₹{amount} ({days} days)\ncmd: `/add_prm {q.from_user.id} {days}d`"
@@ -252,7 +255,6 @@ async def buy_callback(c, q):
     except asyncio.TimeoutError:
         await q.message.reply("⏳ **Timeout!** Process cancelled.")
     except Exception as e:
-        # 🔥 असली एरर यहाँ प्रिंट होगी
         traceback.print_exc()
-        await q.message.reply(f"❌ **Error Occurred:** `{str(e)}`\nTry again later.")
+        await q.message.reply(f"❌ **Error Occurred:** `{str(e)}`")
 
