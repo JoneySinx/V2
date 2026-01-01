@@ -39,14 +39,9 @@ def parse_expire_time(expire):
 def get_ist_str(dt):
     """Convert UTC/Local datetime to Indian Standard Time String"""
     if not dt: return "Unknown"
-    # Assuming dt is stored as naive (local/server time), convert to IST
-    # If server is UTC, we should localize to UTC first then convert.
-    # For simplicity, assuming server time needs simple adjustment or is naive.
-    # Best practice: ensure 'dt' is aware or assume server is UTC.
     try:
-        # Assuming simple naive object, making it aware as UTC then converting to IST
-        # If your server is already IST, this might double add. 
-        # Ideally, just formatting nicely:
+        # If dt is naive, assume it's server time (UTC usually on cloud)
+        # Adjust as needed. Here just formatting for display.
         return dt.strftime("%d %B %Y, %I:%M %p") 
     except:
         return str(dt)
@@ -66,7 +61,6 @@ async def is_premium(user_id, bot):
         expire_dt = parse_expire_time(mp.get("expire"))
         
         if expire_dt and expire_dt < datetime.now():
-            # Expired in Real-time check
             try:
                 btn = [[InlineKeyboardButton("💎 Buy Premium", callback_data="buy_prem")]]
                 await bot.send_message(user_id, "❌ **Plan Expired!**\nRenew with /plan", reply_markup=InlineKeyboardMarkup(btn))
@@ -84,7 +78,6 @@ async def check_premium_expired(bot):
     while True:
         try:
             now = datetime.now()
-            # Loop through all premium users
             async for p in db.premium.find({"status.premium": True}):
                 uid = p["id"]
                 mp = p.get("status", {})
@@ -92,7 +85,6 @@ async def check_premium_expired(bot):
                 
                 if not exp_dt: continue
                 
-                # Calculate remaining seconds
                 left_seconds = (exp_dt - now).total_seconds()
                 left_minutes = left_seconds / 60
                 
@@ -101,7 +93,6 @@ async def check_premium_expired(bot):
                 
                 # 1. EXPIRY HANDLER
                 if left_seconds <= 0:
-                    # Delete last reminder if exists
                     if mp.get("last_reminder_id"):
                         await safe_delete(bot, uid, [mp.get("last_reminder_id")])
 
@@ -115,7 +106,6 @@ async def check_premium_expired(bot):
                         )
                     except: pass
                     
-                    # Reset Data
                     await db.update_plan(uid, {
                         "expire": "", "plan": "", "premium": False, 
                         "reminded_12h": False, "reminded_6h": False, 
@@ -125,58 +115,45 @@ async def check_premium_expired(bot):
                     })
                     continue
 
-                # 2. INTERVAL CHECKER (12h, 6h, 3h, 1h, 30m, 10m)
-                
-                # 12 Hours (Between 11h 55m and 12h 05m)
+                # 2. INTERVAL CHECKER
                 if 715 <= left_minutes <= 725 and not mp.get("reminded_12h"):
                     msg = f"⏰ **Premium Reminder**\n\nYour plan expires in **12 Hours**.\n🗓 {get_ist_str(exp_dt)}"
                     flag = "reminded_12h"
                 
-                # 6 Hours
                 elif 355 <= left_minutes <= 365 and not mp.get("reminded_6h"):
                     msg = f"⚠️ **Premium Alert**\n\nYour plan expires in **6 Hours**.\n🗓 {get_ist_str(exp_dt)}"
                     flag = "reminded_6h"
                 
-                # 3 Hours
                 elif 175 <= left_minutes <= 185 and not mp.get("reminded_3h"):
                     msg = f"⚠️ **Urgent Alert**\n\nYour plan expires in **3 Hours**.\n🗓 {get_ist_str(exp_dt)}"
                     flag = "reminded_3h"
 
-                # 1 Hour
                 elif 55 <= left_minutes <= 65 and not mp.get("reminded_1h"):
                     msg = f"🚨 **Critical Alert**\n\nYour plan expires in **1 Hour**.\n🗓 {get_ist_str(exp_dt)}"
                     flag = "reminded_1h"
 
-                # 30 Minutes
                 elif 25 <= left_minutes <= 35 and not mp.get("reminded_30m"):
                     msg = f"⏳ **Final Warning**\n\nYour plan expires in **30 Minutes**.\nRenew immediately!"
                     flag = "reminded_30m"
                 
-                # 10 Minutes
                 elif 5 <= left_minutes <= 15 and not mp.get("reminded_10m"):
                     msg = f"🔥 **Expiring Soon**\n\nYour plan expires in **10 Minutes**.\nService will stop soon."
                     flag = "reminded_10m"
 
-                # 3. SEND REMINDER & DELETE OLD ONE
                 if msg:
-                    # Delete old reminder message
                     if mp.get("last_reminder_id"):
                         await safe_delete(bot, uid, [mp.get("last_reminder_id")])
                     
                     btn = [[InlineKeyboardButton("💎 Renew Now", callback_data="buy_prem")]]
                     try:
                         sent_msg = await bot.send_message(uid, msg, reply_markup=InlineKeyboardMarkup(btn))
-                        
-                        # Save new state
                         mp[flag] = True
                         mp["last_reminder_id"] = sent_msg.id
                         await db.update_plan(uid, mp)
                     except Exception:
-                        pass # User blocked bot
+                        pass
 
-            # Check every 1 minute to catch 10m/30m windows accurately
             await asyncio.sleep(60)
-            
         except Exception as e:
             print(f"Premium Loop Error: {e}")
             await asyncio.sleep(60)
@@ -195,16 +172,7 @@ async def myplan_cmd(c, m):
         return await m.reply("❌ **No Active Plan**\nTap below to buy!", reply_markup=InlineKeyboardMarkup(btn))
     
     exp = parse_expire_time(mp.get("expire"))
-    
-    # IST Format for User
-    ist_exp = "Unknown"
-    if exp:
-        # Assuming exp is stored in server time, adding +5:30 for display manual if simple string
-        # Or using pytz if datetime object
-        ist_now = datetime.now(IST)
-        # Simple display logic
-        ist_exp = get_ist_str(exp)
-
+    ist_exp = get_ist_str(exp) if exp else "Unknown"
     left = str(exp - datetime.now()).split('.')[0] if exp else "Unknown"
     
     await m.reply(
@@ -248,7 +216,6 @@ async def manage_premium(c, m):
             "expire": ex.strftime("%Y-%m-%d %H:%M:%S"),
             "plan": f"{days} Days",
             "premium": True,
-            # Reset all reminders
             "reminded_12h": False, "reminded_6h": False, "reminded_3h": False,
             "reminded_1h": False, "reminded_30m": False, "reminded_10m": False,
             "last_reminder_id": 0
@@ -294,10 +261,11 @@ async def prm_list(c, m):
     await msg.edit(text)
 
 # =========================
-# 🔘 CALLBACKS (PAYMENT SYSTEM)
+# 🔘 CALLBACKS (FIXED FOR BUTTON ISSUE)
 # =========================
 
-@Client.on_callback_query(filters.regex("^buy_prem$"))
+# 1. BUY PREMIUM HANDLER (Handles both 'buy_prem' and 'activate_plan')
+@Client.on_callback_query(filters.regex(r"^(buy_prem|activate_plan)$"))
 async def buy_callback(c, q):
     prompt_msg = await q.message.edit(
         "💎 **Select Plan Duration**\n\n"
@@ -335,11 +303,12 @@ async def buy_callback(c, q):
         if not receipt.photo:
             return await q.message.reply("❌ **Invalid!** Please send a photo/screenshot.")
         
+        # DELETE QR CODE
         await safe_delete(c, q.message.chat.id, [qr_msg.id])
 
         status_msg = await q.message.reply("✅ **Sent for Verification!**\nAdmin will activate shortly.")
         
-        # Store verification msg ID in DB temp storage (or cache) to delete later
+        # SAVE MESSAGE ID TO DELETE LATER
         VERIFY_CACHE[q.from_user.id] = status_msg.id
         
         cap = f"#Payment\n👤: {q.from_user.mention} (`{q.from_user.id}`)\n💰: ₹{amount} ({days} days)"
@@ -379,7 +348,6 @@ async def payment_action_callback(c, q):
             "expire": ex.strftime("%Y-%m-%d %H:%M:%S"),
             "plan": f"{days} Days",
             "premium": True,
-            # Reset flags
             "reminded_12h": False, "reminded_6h": False, "reminded_3h": False,
             "reminded_1h": False, "reminded_30m": False, "reminded_10m": False,
             "last_reminder_id": 0
@@ -389,6 +357,7 @@ async def payment_action_callback(c, q):
         new_caption = q.message.caption + f"\n\n✅ **Approved by** {q.from_user.mention}"
         await q.message.edit_caption(caption=new_caption, reply_markup=None)
         
+        # DELETE "Sent for Verification" Message
         if user_id in VERIFY_CACHE:
             await safe_delete(c, user_id, [VERIFY_CACHE[user_id]])
             del VERIFY_CACHE[user_id]
