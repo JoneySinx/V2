@@ -16,7 +16,7 @@ async def index_files(bot, query):
     ident = data_parts[1]
     
     if ident == 'yes':
-        # Show collection selection buttons
+        # Show collection selection buttons (Direct Skip 0 comes here directly)
         chat = data_parts[2]
         lst_msg_id = data_parts[3]
         skip = data_parts[4]
@@ -34,7 +34,44 @@ async def index_files(bot, query):
             ]
         ]
         await query.message.edit(
-            "🗂️ <b>Select Collection to Index:</b>\n\n"
+            f"🗂️ <b>Select Collection to Index:</b>\n"
+            f"⏭️ Skip: <code>{skip}</code>\n\n"
+            "• <b>PRIMARY</b> - Main database\n"
+            "• <b>CLOUD</b> - Cloud storage\n"
+            "• <b>ARCHIVES</b> - Archive storage",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        
+    elif ident == 'ask_skip':
+        # Manual Skip Selection
+        chat = data_parts[2]
+        lst_msg_id = data_parts[3]
+        
+        await query.message.edit("📝 <b>Send the number of messages to skip:</b>\n\nSend <code>0</code> to start from beginning.")
+        
+        try:
+            msg = await bot.listen(chat_id=query.message.chat.id, user_id=query.from_user.id)
+            skip = int(msg.text)
+            await msg.delete() # delete user message
+        except:
+            return await query.message.edit("❌ Invalid number or Timeout. Try again.")
+            
+        # After getting skip, show collection buttons
+        buttons = [
+            [
+                InlineKeyboardButton('✅ PRIMARY', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#primary'),
+                InlineKeyboardButton('📂 CLOUD', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#cloud')
+            ],
+            [
+                InlineKeyboardButton('📦 ARCHIVES', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#archive')
+            ],
+            [
+                InlineKeyboardButton('❌ CANCEL', callback_data='close_data')
+            ]
+        ]
+        await query.message.edit(
+            f"🗂️ <b>Select Collection to Index:</b>\n"
+            f"⏭️ Skip: <code>{skip}</code>\n\n"
             "• <b>PRIMARY</b> - Main database\n"
             "• <b>CLOUD</b> - Cloud storage\n"
             "• <b>ARCHIVES</b> - Archive storage",
@@ -100,24 +137,13 @@ async def auto_index(bot, message):
     if chat.type != enums.ChatType.CHANNEL:
         return await message.reply("⚠️ I can only index channels.")
 
-    # Ask for skip number
-    s = await message.reply("📝 Send skip message number (or send 0 to start from beginning):")
-    msg = await bot.listen(chat_id=message.chat.id, user_id=message.from_user.id)
-    await s.delete()
-    
-    try:
-        skip = int(msg.text)
-    except:
-        return await message.reply("❌ Invalid number.")
-
-    # Show collection selection directly
+    # Show Initial Options (Direct Skip 0 OR Custom Skip)
     buttons = [
         [
-            InlineKeyboardButton('✅ PRIMARY', callback_data=f'index#start#{chat_id}#{last_msg_id}#{skip}#primary'),
-            InlineKeyboardButton('📂 CLOUD', callback_data=f'index#start#{chat_id}#{last_msg_id}#{skip}#cloud')
+            InlineKeyboardButton('⚡ START INDEXING (Skip 0)', callback_data=f'index#yes#{chat_id}#{last_msg_id}#0')
         ],
         [
-            InlineKeyboardButton('📦 ARCHIVES', callback_data=f'index#start#{chat_id}#{last_msg_id}#{skip}#archive')
+            InlineKeyboardButton('📝 CUSTOM SKIP', callback_data=f'index#ask_skip#{chat_id}#{last_msg_id}')
         ],
         [
             InlineKeyboardButton('❌ CANCEL', callback_data='close_data')
@@ -126,9 +152,8 @@ async def auto_index(bot, message):
     await message.reply(
         f'🗂️ <b>Ready to Index:</b>\n\n'
         f'📢 Channel: <b>{chat.title}</b>\n'
-        f'📨 Total Messages: <code>{last_msg_id}</code>\n'
-        f'⏭️ Skip: <code>{skip}</code>\n\n'
-        f'Select collection to start indexing:',
+        f'📨 Total Messages: <code>{last_msg_id}</code>\n\n'
+        f'Choose an option:',
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -241,3 +266,4 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
                 f'❗ Errors: <code>{errors}</code>\n'
                 f'🚫 Bad Files: <code>{badfiles}</code>'
             )
+
