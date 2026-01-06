@@ -16,7 +16,18 @@ I am a Powerful Auto Filter Bot with High Speed Streaming & AI Capabilities. ⚡
 Add me to your group and make me Admin! 🚀</b>"""
 
     # ──────────────────────────
-    # 📝 LOGS TEMPLATES (Used in commands.py)
+    # 🚨 REQUIRED VARIABLES (Do Not Remove)
+    # ──────────────────────────
+    # यह info.py के लिए जरूरी है, इसे हटाने से बोट क्रैश होगा।
+    WELCOME_TEXT = """👋 Hello {mention}, Welcome to {title} group! 💞"""
+    
+    # यह फाइल कैप्शन के लिए जरूरी है।
+    FILE_CAPTION = """<i>{file_name}</i>
+
+⚡ <b>Fast Download & Watch Online</b>"""
+
+    # ──────────────────────────
+    # 📝 LOGS TEMPLATES
     # ──────────────────────────
     NEW_GROUP_TXT = """#NewGroup
 Title: {}
@@ -78,14 +89,9 @@ Activate premium to unlock exclusive features:
     # ──────────────────────────
     # ⚠️ MESSAGES
     # ──────────────────────────
-    # Not used in your provided commands.py logic directly, but good to keep standard
     NOT_FILE_TXT = """<b>❌ File Not Found!</b>
 
 👉 Check spelling correctly.
 👉 Try searching with Year.
 👉 Use /ask to verify name."""
-
-    # Used by /stats command in commands.py is dynamically generated there, 
-    # but if you ever switch to a template, keep this format safe.
-    # STATUS_TXT is NOT needed as per your commands.py logic (it builds text dynamically).
 
