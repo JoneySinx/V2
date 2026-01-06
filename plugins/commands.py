@@ -40,7 +40,6 @@ async def start(client, message):
     
     # 1. GROUP HANDLING
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-        # Async DB Call
         if not await db.get_chat(message.chat.id):
             total = await client.get_chat_members_count(message.chat.id)
             user = message.chat.username or "Private"
@@ -55,7 +54,6 @@ async def start(client, message):
         )
 
     # 2. PRIVATE HANDLING
-    # Reactions & Stickers (Non-blocking)
     if REACTIONS:
         try: await message.react(random.choice(REACTIONS), big=True)
         except: pass
@@ -66,7 +64,6 @@ async def start(client, message):
             asyncio.create_task(del_stk(stk))
         except: pass
 
-    # Async User Add
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
         await client.send_message(
@@ -74,7 +71,6 @@ async def start(client, message):
             script.NEW_USER_TXT.format(message.from_user.mention, message.from_user.id)
         )
 
-    # Premium Check
     if IS_PREMIUM and not await is_premium(message.from_user.id, client):
         return await message.reply_photo(
             random.choice(PICS),
@@ -95,7 +91,6 @@ async def start(client, message):
                 grp_id = int(parts[1])
                 file_id = parts[2]
                 
-                # Async DB Calls
                 file = await get_file_details(file_id)
                 if not file:
                     return await message.reply("❌ File Not Found!")
@@ -120,17 +115,14 @@ async def start(client, message):
                     reply_markup=InlineKeyboardMarkup(btn)
                 )
 
-                # Auto Delete
                 if PM_FILE_DELETE_TIME > 0:
                     del_msg = await msg.reply(
                         f"⚠️ This message will delete in {get_readable_time(PM_FILE_DELETE_TIME)}."
                     )
-                    # Non-blocking delete task
                     asyncio.create_task(
                         auto_delete_messages([msg.id, del_msg.id], message.chat.id, client, PM_FILE_DELETE_TIME)
                     )
                     
-                    # Store for close button logic
                     if not hasattr(temp, 'PM_FILES'): temp.PM_FILES = {}
                     temp.PM_FILES[msg.id] = {'file_msg': msg.id, 'note_msg': del_msg.id}
                 return
@@ -138,30 +130,25 @@ async def start(client, message):
         except Exception as e:
             print(f"Start Error: {e}")
 
-    # 4. DEFAULT START MESSAGE
+    # 4. DEFAULT START MESSAGE (Buttons Removed as Requested)
     await message.reply_photo(
         random.choice(PICS),
         caption=script.START_TXT.format(message.from_user.mention, get_wish()),
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("+ Add to Group +", url=f"https://t.me/{temp.U_NAME}?startgroup=start")],
-            [InlineKeyboardButton("👨‍🚒 Help", callback_data="help"), InlineKeyboardButton("📚 About", callback_data="about")],
-            [InlineKeyboardButton("💎 Premium Status", callback_data="myplan")]
+            [InlineKeyboardButton("👨‍🚒 Help", callback_data="help")]
         ])
     )
 
 # ─────────────────────────
-# /stats COMMAND (Optimized)
+# /stats COMMAND
 # ─────────────────────────
 @Client.on_message(filters.command("stats") & filters.user(ADMINS))
 async def stats(_, message):
     msg = await message.reply("🔄 Fetching Stats...")
     
-    # All Async Calls
     files = await db_count_documents()
     users = await db.total_users_count()
     chats = await db.total_chat_count()
-    
-    # Direct Motor Count (Super Fast)
     premium = await db.premium.count_documents({"status.premium": True})
 
     text = f"""
@@ -195,7 +182,7 @@ async def delete_file_cmd(client, message):
         return await message.reply("❌ Invalid Storage! Use: primary, cloud, archive")
     
     msg = await message.reply("🗑 Deleting...")
-    count = await delete_files(query, storage) # Async Call
+    count = await delete_files(query, storage)
     
     if count: await msg.edit(f"✅ Deleted `{count}` files from `{storage}`.")
     else: await msg.edit("❌ No files found.")
@@ -227,7 +214,7 @@ async def confirm_del(client, query):
     storage = query.data.split("#")[1]
     await query.message.edit("🗑 Processing... This may take time.")
     
-    count = await delete_files("*", storage) # Async
+    count = await delete_files("*", storage)
     await query.message.edit(f"✅ Deleted `{count}` files from `{storage}`.")
 
 # ─────────────────────────
@@ -237,12 +224,11 @@ async def confirm_del(client, query):
 async def myplan_cb(client, query):
     if not IS_PREMIUM: return await query.answer("Premium disabled.", show_alert=True)
     
-    mp = await db.get_plan(query.from_user.id) # Async
+    mp = await db.get_plan(query.from_user.id)
     if not mp.get('premium'):
         btn = [[InlineKeyboardButton('💎 Buy Premium', callback_data='activate_plan')]]
         return await query.message.edit("❌ No active plan.", reply_markup=InlineKeyboardMarkup(btn))
     
-    # Fast Date Parsing
     expire = mp.get('expire')
     if isinstance(expire, str):
         try: expire = datetime.strptime(expire, "%Y-%m-%d %H:%M:%S")
@@ -280,7 +266,6 @@ async def stream_cb(client, query):
 async def close_cb(c, q):
     try:
         await q.message.delete()
-        # Handle linked note deletion
         if hasattr(temp, 'PM_FILES') and q.message.id in temp.PM_FILES:
             try:
                 note_id = temp.PM_FILES[q.message.id]['note_msg']
