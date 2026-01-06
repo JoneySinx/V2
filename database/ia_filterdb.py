@@ -10,15 +10,18 @@ from info import DATABASE_URL, DATABASE_NAME, MAX_BTN
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# ⚙️ MOTOR ASYNC CONNECTION (NON-BLOCKING)
+# ⚙️ MOTOR ASYNC CONNECTION
 # ─────────────────────────────────────────
 client = motor.motor_asyncio.AsyncIOMotorClient(
     DATABASE_URL,
-    maxPoolSize=50,       # Koyeb के लिए बेस्ट
+    maxPoolSize=50,
     minPoolSize=10,
     serverSelectionTimeoutMS=5000
 )
 db = client[DATABASE_NAME]
+
+# Media = Collection (Used for 'Import Error' fix)
+Media = db["Primary"] 
 
 primary = db["Primary"]
 cloud   = db["Cloud"]
@@ -31,17 +34,46 @@ COLLECTIONS = {
 }
 
 # ─────────────────────────────────────────
+# 🛠 UTILS: FILE ID DECODING (FIXED)
+# ─────────────────────────────────────────
+def encode_file_id(s: bytes) -> str:
+    """Encode bytes to URL-safe base64 string"""
+    r = b""
+    r += pack("<ii", s.major, s.minor)
+    if s.file_reference:
+        r += pack("<i", len(s.file_reference))
+        r += s.file_reference
+    r += pack("<ii", s.file_type, s.dc_id)
+    if s.photo_size_source:
+        r += pack("<i", s.photo_size_source)
+    if s.photo_size_type:
+        r += pack("<i", s.photo_size_type)
+    r += pack("<ii", s.volume_id, s.local_id)
+    if s.access_hash:
+        r += pack("<q", s.access_hash)
+    return base64.urlsafe_b64encode(r).decode().rstrip("=")
+
+def unpack_new_file_id(new_file_id):
+    """Return unique file_id string from Hydrogram FileId"""
+    try:
+        decoded = FileId.decode(new_file_id)
+        file_id = encode_file_id(decoded)
+        return file_id
+    except Exception as e:
+        logger.error(f"File ID Decode Error: {e}")
+        return None
+
+# ─────────────────────────────────────────
 # ⚡ INDEXES (BACKGROUND)
 # ─────────────────────────────────────────
 async def ensure_indexes():
     """Create text indexes for fast search"""
     for name, col in COLLECTIONS.items():
         try:
-            # TEXT index search के लिए जरूरी है
             await col.create_index(
                 [("file_name", "text"), ("caption", "text")],
                 name=f"{name}_text",
-                background=True  # बोट को रोके बिना इंडेक्स बनाएगा
+                background=True
             )
         except Exception as e:
             logger.error(f"Index creation failed for {name}: {e}")
@@ -55,20 +87,17 @@ REPLACEMENTS = str.maketrans({
 })
 
 def normalize_query(q: str) -> str:
-    """Normalize search query"""
     q = q.lower().translate(REPLACEMENTS)
     q = re.sub(r"[^a-z0-9\s]", " ", q)
     return re.sub(r"\s+", " ", q).strip()
 
 def prefix_query(q: str) -> str:
-    """Create prefix query for fallback"""
     return " ".join(w[:4] for w in q.split() if len(w) >= 3)
 
 # ─────────────────────────────────────────
-# 📊 DB STATS (ASYNC)
+# 📊 DB STATS
 # ─────────────────────────────────────────
 async def db_count_documents():
-    """Get document counts"""
     try:
         p = await primary.estimated_document_count()
         c = await cloud.estimated_document_count()
@@ -84,18 +113,19 @@ async def db_count_documents():
         return {"primary": 0, "cloud": 0, "archive": 0, "total": 0}
 
 # ─────────────────────────────────────────
-# 💾 SAVE FILE (ASYNC)
+# 💾 SAVE FILE
 # ─────────────────────────────────────────
 async def save_file(media, collection_type="primary"):
     try:
         file_id = unpack_new_file_id(media.file_id)
+        if not file_id: return "err"
         
-        # क्लीन नाम और कैप्शन
         f_name = re.sub(r"@\w+", "", media.file_name or "").strip()
         caption = re.sub(r"@\w+", "", media.caption or "").strip()
 
         doc = {
             "_id": file_id,
+            "file_id": media.file_id,  # Store original too for safety
             "file_name": f_name,
             "caption": caption,
             "file_size": media.file_size
@@ -111,22 +141,16 @@ async def save_file(media, collection_type="primary"):
         return "err"
 
 # ─────────────────────────────────────────
-# 🔍 ULTRA FAST SEARCH CORE (ASYNC)
+# 🔍 SEARCH CORE
 # ─────────────────────────────────────────
 def _text_filter(q):
     return {"$text": {"$search": q}}
 
 async def _search(col, q, offset, limit):
     try:
-        # Motor cursor usage
         cursor = col.find(
             _text_filter(q),
-            {
-                "file_name": 1,
-                "file_size": 1,
-                "caption": 1,
-                "score": {"$meta": "textScore"}
-            }
+            {"file_name": 1, "file_size": 1, "caption": 1, "file_id": 1, "score": {"$meta": "textScore"}}
         )
         cursor.sort([("score", {"$meta": "textScore"})])
         cursor.skip(offset).limit(limit)
@@ -139,7 +163,7 @@ async def _search(col, q, offset, limit):
         return [], 0
 
 # ─────────────────────────────────────────
-# 🚀 PUBLIC SEARCH API (ASYNC CASCADE)
+# 🚀 PUBLIC SEARCH API
 # ─────────────────────────────────────────
 async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, collection_type="primary"):
     if not query or not query.strip():
@@ -154,7 +178,7 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
     total = 0
     actual_source = collection_type
 
-    # ⚡ ASYNC CASCADE SEARCH: Primary → Cloud → Archive
+    # ⚡ ASYNC CASCADE
     if collection_type == "all":
         # 1. Primary
         docs, cnt = await _search(primary, query, offset, max_results)
@@ -163,7 +187,7 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
             total += cnt
             actual_source = "primary"
         
-        # 2. Cloud (If primary failed)
+        # 2. Cloud
         if not results:
             docs, cnt = await _search(cloud, query, offset, max_results)
             if docs:
@@ -171,7 +195,7 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
                 total += cnt
                 actual_source = "cloud"
             
-            # 3. Archive (If cloud failed)
+            # 3. Archive
             if not results:
                 docs, cnt = await _search(archive, query, offset, max_results)
                 if docs:
@@ -179,9 +203,9 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
                     total += cnt
                     actual_source = "archive"
                 
-                # 4. Fallback (Prefix Search)
+                # 4. Fallback
                 if not results and prefix:
-                    for col_name, col in [("primary", primary), ("cloud", cloud), ("archive", archive)]:
+                    for col_name, col in COLLECTIONS.items():
                         docs, cnt = await _search(col, prefix, 0, max_results)
                         if docs:
                             results.extend(docs)
@@ -189,7 +213,7 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
                             actual_source = col_name
                             break
 
-    # Single Collection Search
+    # Single DB Search
     elif collection_type in COLLECTIONS:
         col = COLLECTIONS[collection_type]
         docs, cnt = await _search(col, query, offset, max_results)
@@ -202,12 +226,10 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
             total += cnt
             
     else:
-        # Default fallback
         docs, cnt = await _search(primary, query, offset, max_results)
         results.extend(docs)
         total += cnt
 
-    # 5. Language Filter
     if lang and results:
         lang = lang.lower()
         results = [f for f in results if lang in f["file_name"].lower()]
@@ -220,7 +242,7 @@ async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None, co
     return results, next_offset, total, actual_source
 
 # ─────────────────────────────────────────
-# 🗑 DELETE FILES (ASYNC)
+# 🗑 DELETE FILES
 # ─────────────────────────────────────────
 async def delete_files(query, collection_type="all"):
     deleted = 0
@@ -240,8 +262,6 @@ async def delete_files(query, collection_type="all"):
             if collection_type != "all" and name != collection_type: continue
             res = await col.delete_many(flt)
             deleted += res.deleted_count
-            if res.deleted_count > 0:
-                logger.info(f"🗑️ Deleted {res.deleted_count} from {name}")
 
         return deleted
     except Exception as e:
@@ -249,7 +269,7 @@ async def delete_files(query, collection_type="all"):
         return deleted
 
 # ─────────────────────────────────────────
-# 📂 FILE DETAILS & UTILS (ASYNC)
+# 📂 FILE DETAILS
 # ─────────────────────────────────────────
 async def get_file_details(file_id):
     try:
@@ -258,22 +278,5 @@ async def get_file_details(file_id):
             if doc: return doc
         return None
     except Exception:
-        return None
-
-# --- File ID Encoding Utils (CPU bound, keep sync) ---
-def encode_file_id(s: bytes) -> str:
-    r, n = b"", 0
-    for i in s + bytes([22, 4]):
-        if i == 0: n += 1
-        else:
-            if n: r += b"\x00" + bytes([n]); n = 0
-            r += bytes([i])
-    return base64.urlsafe_b64encode(r).decode().rstrip("=")
-
-def unpack_new_file_id(new_file_id):
-    try:
-        d = FileId.decode(new_file_id)
-        return encode_file_id(pack("<iiqq", int(d.file_type), d.dc_id, d.media_id, d.access_hash))
-    except:
         return None
 
