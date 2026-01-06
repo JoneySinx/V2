@@ -1,13 +1,15 @@
 import os
 import random
 import asyncio
+from bson.objectid import ObjectId  # 🔥 ये Import जरूरी है ID फिक्स के लिए
 from datetime import datetime
 from time import time as time_now
 from hydrogram import Client, filters, enums
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from Script import script
-from database.ia_filterdb import db_count_documents, get_file_details, delete_files
+# 🔥 Media को इम्पोर्ट किया ताकि हम सीधे डेटाबेस में ढूंढ सकें
+from database.ia_filterdb import db_count_documents, get_file_details, delete_files, Media
 from database.users_chats_db import db
 
 from info import (
@@ -33,7 +35,7 @@ async def auto_delete_messages(msg_ids, chat_id, client, delay):
     except: pass
 
 # ─────────────────────────
-# /start COMMAND
+# /start COMMAND (Fixed ID Issue)
 # ─────────────────────────
 @Client.on_message(filters.command("start") & filters.incoming)
 async def start(client, message):
@@ -91,9 +93,34 @@ async def start(client, message):
                 grp_id = int(parts[1])
                 file_id = parts[2]
                 
-                file = await get_file_details(file_id)
+                # 🔥 ID MATCHING FIX (String vs ObjectId)
+                file = None
+                
+                # A. Try Finding as String (Standard)
+                try:
+                    file = await Media.find_one({"_id": file_id})
+                except: pass
+
+                # B. Try Finding as ObjectId (Old Files)
                 if not file:
-                    return await message.reply("❌ File Not Found!")
+                    try:
+                        file = await Media.find_one({"_id": ObjectId(file_id)})
+                    except: pass
+                
+                # C. Deep Search in Collections (If still not found)
+                if not file:
+                    for collection in ["cloud", "archive"]:
+                        try:
+                            # Try String
+                            file = await Media.find_one({"_id": file_id, "collection_type": collection})
+                            if file: break
+                            # Try ObjectId
+                            file = await Media.find_one({"_id": ObjectId(file_id), "collection_type": collection})
+                            if file: break
+                        except: continue
+
+                if not file:
+                    return await message.reply("❌ **File Not Found!**\n\nIt seems the file was deleted or the ID is invalid.")
                 
                 settings = await get_settings(grp_id)
                 cap_template = settings.get('caption', '{file_name}\n\n💾 Size: {file_size}')
@@ -106,11 +133,11 @@ async def start(client, message):
                 
                 btn = [[InlineKeyboardButton('❌ Close', callback_data='close_data')]]
                 if IS_STREAM:
-                    btn.insert(0, [InlineKeyboardButton("▶️ Watch / Download", callback_data=f"stream#{file_id}")])
+                    btn.insert(0, [InlineKeyboardButton("▶️ Watch / Download", callback_data=f"stream#{str(file['_id'])}")])
 
                 msg = await client.send_cached_media(
                     chat_id=message.chat.id,
-                    file_id=file_id,
+                    file_id=file['file_id'],
                     caption=caption,
                     reply_markup=InlineKeyboardMarkup(btn)
                 )
@@ -129,8 +156,9 @@ async def start(client, message):
 
         except Exception as e:
             print(f"Start Error: {e}")
+            return await message.reply("❌ Error fetching file details.")
 
-    # 4. DEFAULT START MESSAGE (Cleaned as requested)
+    # 4. DEFAULT START MESSAGE
     await message.reply_photo(
         random.choice(PICS),
         caption=script.START_TXT.format(message.from_user.mention, get_wish()),
@@ -140,7 +168,7 @@ async def start(client, message):
     )
 
 # ─────────────────────────
-# /link COMMAND (Generate Link on Reply)
+# /link COMMAND
 # ─────────────────────────
 @Client.on_message(filters.command("link") & filters.incoming)
 async def link_command(client, message):
@@ -156,13 +184,11 @@ async def link_command(client, message):
     msg = await message.reply("🔗 **Generating Link...**", quote=True)
     
     try:
-        # Send to BIN Channel for Permanent ID
         log_msg = await client.send_cached_media(
             chat_id=BIN_CHANNEL,
             file_id=media.file_id
         )
         
-        # Construct Links
         stream_link = f"{URL}watch/{log_msg.id}"
         download_link = f"{URL}download/{log_msg.id}"
         
@@ -301,15 +327,18 @@ async def stream_cb(client, query):
     file_id = query.data.split("#")[1]
     await query.answer("🔗 Generating Links...")
     
-    msg = await client.send_cached_media(BIN_CHANNEL, file_id)
-    watch = f"{URL}watch/{msg.id}"
-    dl = f"{URL}download/{msg.id}"
-    
-    btn = [
-        [InlineKeyboardButton("▶️ Watch", url=watch), InlineKeyboardButton("⬇️ Download", url=dl)],
-        [InlineKeyboardButton("❌ Close", callback_data="close_data")]
-    ]
-    await query.message.edit_reply_markup(InlineKeyboardMarkup(btn))
+    try:
+        msg = await client.send_cached_media(BIN_CHANNEL, file_id)
+        watch = f"{URL}watch/{msg.id}"
+        dl = f"{URL}download/{msg.id}"
+        
+        btn = [
+            [InlineKeyboardButton("▶️ Watch", url=watch), InlineKeyboardButton("⬇️ Download", url=dl)],
+            [InlineKeyboardButton("❌ Close", callback_data="close_data")]
+        ]
+        await query.message.edit_reply_markup(InlineKeyboardMarkup(btn))
+    except Exception as e:
+        await query.message.edit(f"❌ Error: {e}")
 
 @Client.on_callback_query(filters.regex("^close_data$"))
 async def close_cb(c, q):
