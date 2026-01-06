@@ -130,7 +130,7 @@ async def start(client, message):
         except Exception as e:
             print(f"Start Error: {e}")
 
-    # 4. DEFAULT START MESSAGE (Buttons Removed as Requested)
+    # 4. DEFAULT START MESSAGE (Cleaned as requested)
     await message.reply_photo(
         random.choice(PICS),
         caption=script.START_TXT.format(message.from_user.mention, get_wish()),
@@ -138,6 +138,55 @@ async def start(client, message):
             [InlineKeyboardButton("👨‍🚒 Help", callback_data="help")]
         ])
     )
+
+# ─────────────────────────
+# /link COMMAND (Generate Link on Reply)
+# ─────────────────────────
+@Client.on_message(filters.command("link") & filters.incoming)
+async def link_command(client, message):
+    if not message.reply_to_message:
+        return await message.reply("⚠️ **Please reply to a file** to generate a link.")
+    
+    reply = message.reply_to_message
+    media = reply.document or reply.video or reply.audio
+    
+    if not media:
+        return await message.reply("⚠️ This is not a valid media file.")
+    
+    msg = await message.reply("🔗 **Generating Link...**", quote=True)
+    
+    try:
+        # Send to BIN Channel for Permanent ID
+        log_msg = await client.send_cached_media(
+            chat_id=BIN_CHANNEL,
+            file_id=media.file_id
+        )
+        
+        # Construct Links
+        stream_link = f"{URL}watch/{log_msg.id}"
+        download_link = f"{URL}download/{log_msg.id}"
+        
+        btn = [
+            [InlineKeyboardButton("▶️ Watch Online", url=stream_link)],
+            [InlineKeyboardButton("⬇️ Fast Download", url=download_link)]
+        ]
+        
+        file_name = media.file_name if hasattr(media, 'file_name') else "Unknown File"
+        file_size = get_size(media.file_size)
+        
+        await msg.edit(
+            f"<b>✅ Link Generated!</b>\n\n"
+            f"📂 <b>File:</b> {file_name}\n"
+            f"💾 <b>Size:</b> {file_size}\n\n"
+            f"<b>🔗 Stream:</b> {stream_link}\n"
+            f"<b>📥 Download:</b> {download_link}",
+            reply_markup=InlineKeyboardMarkup(btn),
+            disable_web_page_preview=True
+        )
+        
+    except Exception as e:
+        await msg.edit(f"❌ **Error:** `{str(e)}`")
+
 
 # ─────────────────────────
 # /stats COMMAND
